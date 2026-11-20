@@ -11,7 +11,25 @@ export interface PlaylistDrawerProps {
   onSongSelected?: (song: SongRecord) => void;
 }
 
-type DrawerTab = 'queue' | 'playlists' | 'local';
+type DrawerTab = 'queue' | 'playlists' | 'podcast' | 'local';
+
+interface MyPodcast {
+  id: string | number;
+  name: string;
+  cover?: string;
+  sub?: string;
+}
+
+function pickList(res: Record<string, unknown>, keys: string[]): Array<Record<string, unknown>> {
+  for (const k of keys) {
+    const v = res[k];
+    if (Array.isArray(v)) return v as Array<Record<string, unknown>>;
+  }
+  const data = res.data;
+  if (Array.isArray(data)) return data as Array<Record<string, unknown>>;
+  if (data && typeof data === 'object') return pickList(data as Record<string, unknown>, keys);
+  return [];
+}
 
 const PLAY_MODE_LABELS: Record<PlayMode, string> = {
   loop: '顺序循环',
@@ -43,6 +61,12 @@ export function PlaylistDrawer({
   const fx = usePlayerStore((s) => s.fx);
   const updateFx = usePlayerStore((s) => s.updateFx);
   const homeDiscover = usePlayerStore((s) => s.homeDiscover);
+  const refreshAllUserPlaylists = usePlayerStore((s) => s.refreshAllUserPlaylists);
+  const [myPodcasts, setMyPodcasts] = useState<MyPodcast[]>([]);
+  const [podcastLoading, setPodcastLoading] = useState(false);
+  const [openPodcastId, setOpenPodcastId] = useState<string | number | null>(null);
+  const [podcastItems, setPodcastItems] = useState<SongRecord[]>([]);
+  const [podcastItemsLoading, setPodcastItemsLoading] = useState(false);
 
   const [activeTab, setActiveTab] = useState<DrawerTab>('queue');
   const [newPlaylistName, setNewPlaylistName] = useState('');
@@ -68,18 +92,102 @@ export function PlaylistDrawer({
   const refreshCrossPlatformPlaylists = async () => {
     await refreshBuiltInPlaylists();
     try {
-      const res = await apiJson<{ playlists?: PlaylistSummary[]; playlist?: PlaylistSummary[] }>(
-        '/api/user/playlists',
-        { timeoutMs: 8000 }
-      );
-      const list = res.playlists || res.playlist || [];
-      if (Array.isArray(list)) {
-        usePlayerStore.setState({ userPlaylists: list });
-      }
+      await refreshAllUserPlaylists();
     } catch {
       // ignore if unauthenticated or offline
     }
     onToast?.('歌单列表已刷新');
+  };
+
+  const loadMyPodcasts = async () => {
+    setPodcastLoading(true);
+    try {
+      const res = await apiJson<Record<string, unknown>>('/api/podcast/my', { timeoutMs: 8000 });
+      const list = pickList(res || {}, ['podcasts', 'radios', 'djRadios', 'list', 'items']);
+      setMyPodcasts(
+        list
+          .map((raw): MyPodcast | null => {
+            const id = (raw.id ?? raw.radioId ?? raw.podcastId) as string | number | undefined;
+            if (id === undefined || id === null || id === '') return null;
+            return {
+              id,
+              name: String(raw.name || raw.title || '未命名电台'),
+              cover: String(raw.cover || raw.picUrl || ''),
+              sub: String(raw.dj || raw.artist || raw.desc || raw.description || ''),
+            };
+          })
+          .filter((x): x is MyPodcast => Boolean(x))
+      );
+    } catch {
+      setMyPodcasts([]);
+      onToast?.('读取我的播客失败，请先登录网易云');
+    } finally {
+      setPodcastLoading(false);
+    }
+  };
+
+  const toggleMyPodcast = async (pod: MyPodcast) => {
+    if (openPodcastId === pod.id) {
+      setOpenPodcastId(null);
+      setPodcastItems([]);
+      return;
+    }
+    setOpenPodcastId(pod.id);
+    setPodcastItems([]);
+    setPodcastItemsLoading(true);
+    try {
+      const res = await apiJson<Record<string, unknown>>(
+        `/api/podcast/my/items?id=${encodeURIComponent(String(pod.id))}`,
+        { timeoutMs: 10000 }
+      );
+      const list = pickList(res || {}, ['programs', 'songs', 'tracks', 'items', 'list']) as unknown as SongRecord[];
+      setPodcastItems(
+        list.map((p) => ({
+          ...p,
+          provider: p.provider || 'netease',
+          type: 'podcast',
+          podcastId: p.podcastId ?? pod.id,
+          cover: p.cover || pod.cover,
+        }))
+      );
+    } catch {
+      onToast?.('读取节目失败');
+    } finally {
+      setPodcastItemsLoading(false);
+    }
+  };
+
+  const handleReorderTrack = async (
+    playlistId: string,
+    from: number,
+    to: number,
+    e: React.MouseEvent
+  ) => {
+    e.stopPropagation();
+    if (to < 0 || to >= activePlaylistTracks.length) return;
+    const res = await desktopWindow.reorderBuiltInPlaylistTrack(playlistId, from, to);
+    if (res.ok) {
+      const target = usePlayerStore
+        .getState()
+        .builtInPlaylists.find((p) => String(p.id) === playlistId);
+      if (target) await loadPlaylistTracks(target);
+    } else {
+      onToast?.(res.error || '调整顺序失败');
+    }
+  };
+
+  const handleSetNext = (idx: number, e: React.MouseEvent) => {
+    e.stopPropagation();
+    const st = usePlayerStore.getState();
+    if (idx === st.currentIdx || idx < 0 || idx >= st.playQueue.length) return;
+    const queue = [...st.playQueue];
+    const [moved] = queue.splice(idx, 1);
+    const curKey = st.currentSong ? songIdentityKey(st.currentSong) : '';
+    let curPos = curKey ? queue.findIndex((q) => songIdentityKey(q) === curKey) : st.currentIdx;
+    if (curPos < 0) curPos = Math.min(st.currentIdx, queue.length - 1);
+    queue.splice(curPos + 1, 0, moved);
+    usePlayerStore.setState({ playQueue: queue, currentIdx: curPos });
+    onToast?.(`已设为下一首：${moved.name}`);
   };
 
   const handleCreateBuiltIn = async (nameRaw: string) => {
@@ -342,6 +450,19 @@ export function PlaylistDrawer({
               我的歌单
             </button>
             <button
+              id="tab-podcast"
+              role="tab"
+              type="button"
+              aria-selected={activeTab === 'podcast'}
+              className={`panel-tab${activeTab === 'podcast' ? ' active' : ''}`}
+              onClick={() => {
+                setActiveTab('podcast');
+                loadMyPodcasts().catch(() => {});
+              }}
+            >
+              我的播客
+            </button>
+            <button
               id="tab-local"
               role="tab"
               type="button"
@@ -420,6 +541,16 @@ export function PlaylistDrawer({
                         <div className="qi-sub">{song.artist || '未知歌手'}</div>
                       </div>
                       <div className="qi-act">
+                        {!isNow && (
+                          <button
+                            type="button"
+                            title="设为下一首"
+                            aria-label="设为下一首"
+                            onClick={(e) => handleSetNext(idx, e)}
+                          >
+                            下一首
+                          </button>
+                        )}
                         <button
                           type="button"
                           title="从队列移除"
@@ -627,6 +758,26 @@ export function PlaylistDrawer({
                                 <div className="qi-act">
                                   <button
                                     type="button"
+                                    title="上移"
+                                    disabled={idx === 0}
+                                    onClick={(e) => {
+                                      handleReorderTrack(String(pl.id), idx, idx - 1, e).catch(() => {});
+                                    }}
+                                  >
+                                    ↑
+                                  </button>
+                                  <button
+                                    type="button"
+                                    title="下移"
+                                    disabled={idx === activePlaylistTracks.length - 1}
+                                    onClick={(e) => {
+                                      handleReorderTrack(String(pl.id), idx, idx + 1, e).catch(() => {});
+                                    }}
+                                  >
+                                    ↓
+                                  </button>
+                                  <button
+                                    type="button"
                                     title="从歌单移除"
                                     onClick={(e) => {
                                       handleRemoveTrackFromBuiltIn(String(pl.id), idx, e).catch(() => {});
@@ -695,6 +846,73 @@ export function PlaylistDrawer({
 
               {builtInPlaylists.length === 0 && combinedCrossPlatformPlaylists.length === 0 && (
                 <div className="search-empty">暂无歌单，点击“+ 新建内置”创建跨平台歌单</div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {activeTab === 'podcast' && (
+          <div id="podcast-pane">
+            <div className="queue-toolbar">
+              <div className="queue-chip">我的播客 · {myPodcasts.length} 个</div>
+              <button
+                className="fx-mini-btn ghost"
+                type="button"
+                onClick={() => {
+                  loadMyPodcasts().catch(() => {});
+                }}
+                style={{ height: 26, padding: '0 10px', fontSize: 11 }}
+              >
+                刷新
+              </button>
+            </div>
+            <div className="queue-list">
+              {podcastLoading ? (
+                <div className="search-empty">加载中...</div>
+              ) : myPodcasts.length === 0 ? (
+                <div className="search-empty">暂无订阅播客，请先登录网易云</div>
+              ) : (
+                myPodcasts.map((pod) => (
+                  <div key={String(pod.id)} className="pl-card" style={{ padding: 10 }}>
+                    <div
+                      style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer' }}
+                      onClick={() => {
+                        toggleMyPodcast(pod).catch(() => {});
+                      }}
+                    >
+                      {pod.cover && <img src={coverProxyUrl(pod.cover)} alt={pod.name} />}
+                      <div style={{ minWidth: 0, flex: 1 }}>
+                        <div className="qi-name">{pod.name}</div>
+                        <div className="qi-sub">{pod.sub || '播客'}</div>
+                      </div>
+                    </div>
+                    {openPodcastId === pod.id && (
+                      <div style={{ marginTop: 10, display: 'grid', gap: 6 }}>
+                        {podcastItemsLoading ? (
+                          <div className="qi-sub">加载节目中...</div>
+                        ) : podcastItems.length === 0 ? (
+                          <div className="qi-sub">暂无节目</div>
+                        ) : (
+                          podcastItems.map((item, idx) => (
+                            <div
+                              key={`${songIdentityKey(item)}-${idx}`}
+                              className="queue-item"
+                              onClick={() => {
+                                onSongSelected?.(item);
+                                playSong(idx, podcastItems).catch(() => {});
+                              }}
+                            >
+                              <div className="qi-info">
+                                <div className="qi-name">{item.name || item.title}</div>
+                                <div className="qi-sub">{item.artist || pod.name}</div>
+                              </div>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    )}
+                  </div>
+                ))
               )}
             </div>
           </div>
