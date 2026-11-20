@@ -1,4 +1,4 @@
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::{self, Next};
@@ -14,7 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 use tower_http::cors::CorsLayer;
 
-use crate::analyzer::dj::analyze_podcast_dj_stream;
+use crate::analyzer::dj::analyze_podcast_dj_stream_with_options;
 use crate::config::{
     compare_versions, extract_release_download_pages, extract_release_notes, normalize_version,
     safe_external_update_url, write_json_pretty_atomic, ConfigManager,
@@ -181,6 +181,127 @@ fn err_json(status: StatusCode, err: impl Into<String>) -> Response {
         .into_response()
 }
 
+fn json_id_str(v: Option<&Value>) -> String {
+    match v {
+        Some(Value::String(s)) => s.trim().to_string(),
+        Some(Value::Number(n)) => {
+            if let Some(i) = n.as_i64() {
+                i.to_string()
+            } else if let Some(u) = n.as_u64() {
+                u.to_string()
+            } else if let Some(f) = n.as_f64() {
+                if f.is_finite() {
+                    if f.fract().abs() < 1e-9 {
+                        format!("{:.0}", f)
+                    } else {
+                        f.to_string()
+                    }
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            }
+        }
+        Some(Value::Object(obj)) => {
+            for key in [
+                "id",
+                "songId",
+                "trackId",
+                "playlistId",
+                "albumId",
+                "cid",
+                "commentId",
+                "listId",
+                "pid",
+                "global_collection_id",
+                "mid",
+                "hash",
+                "fileHash",
+                "value",
+            ] {
+                if let Some(inner) = obj.get(key) {
+                    let s = json_id_str(Some(inner));
+                    if !s.is_empty() {
+                        return s;
+                    }
+                }
+            }
+            String::new()
+        }
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .map(|item| json_id_str(Some(item)))
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(","),
+        _ => String::new(),
+    }
+}
+
+fn json_bool(v: Option<&Value>, default: bool) -> bool {
+    match v {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => n
+            .as_i64()
+            .map(|i| i != 0)
+            .or_else(|| n.as_f64().map(|f| f.is_finite() && f != 0.0))
+            .unwrap_or(default),
+        Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => default,
+        },
+        _ => default,
+    }
+}
+
+fn json_f64(v: Option<&Value>, default: f64) -> f64 {
+    match v {
+        Some(Value::Number(n)) => n.as_f64().filter(|f| f.is_finite()).unwrap_or(default),
+        Some(Value::String(s)) => s
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|f| f.is_finite())
+            .unwrap_or(default),
+        _ => default,
+    }
+}
+
+fn parse_action_toggle(v: Option<&Value>, default: bool) -> bool {
+    let Some(val) = v else {
+        return default;
+    };
+    let s = json_id_str(Some(val)).to_ascii_lowercase();
+    match s.as_str() {
+        "1" | "true" => true,
+        "0" | "2" | "false" => false,
+        _ => json_bool(Some(val), default),
+    }
+}
+
+fn merge_query_and_body(q: &HashMap<String, String>, body: &Bytes) -> Value {
+    let mut map = serde_json::Map::new();
+    for (k, v) in q {
+        map.insert(k.clone(), Value::String(v.clone()));
+    }
+    if !body.is_empty() {
+        if let Ok(Value::Object(obj)) = serde_json::from_slice::<Value>(body) {
+            for (k, v) in obj {
+                if !v.is_null() || !map.contains_key(&k) {
+                    map.insert(k, v);
+                }
+            }
+        } else {
+            for (k, v) in url::form_urlencoded::parse(body) {
+                map.insert(k.into_owned(), Value::String(v.into_owned()));
+            }
+        }
+    }
+    Value::Object(map)
+}
+
 async fn easter_egg_gate_middleware(
     State(state): State<Arc<AppBackendState>>,
     req: Request<Body>,
@@ -216,11 +337,13 @@ pub fn build_router(state: Arc<AppBackendState>) -> Router {
         .route("/api/beatmap/cache", get(beatmap_cache_get).post(beatmap_cache_post))
         .route("/api/cuefield/transition", post(cuefield_transition))
         .route("/api/cuefield/feedback", get(cuefield_feedback_get).post(cuefield_feedback_post))
-        .route("/api/podcast/dj-beatmap", post(podcast_dj_beatmap))
+        .route("/api/podcast/dj-beatmap", any(podcast_dj_beatmap))
         .route("/api/listen/report", post(listen_report))
         .route("/api/listen/total", get(listen_total))
         .route("/api/discover/home", get(discover_home))
+        .route("/api/discover", get(discover_home))
         .route("/api/weather/radio", get(weather_radio))
+        .route("/api/weather-radio", get(weather_radio))
         .route("/api/weather/ip-location", get(weather_ip_location))
         // Netease
         .route("/api/search", get(netease_search))
@@ -228,16 +351,17 @@ pub fn build_router(state: Arc<AppBackendState>) -> Router {
         .route("/api/lyric", get(netease_lyric))
         .route("/api/user/playlists", get(netease_user_playlists))
         .route("/api/playlist/tracks", get(netease_playlist_tracks))
-        .route("/api/playlist/create", post(netease_playlist_create))
-        .route("/api/playlist/add-song", post(netease_playlist_add_song))
-        .route("/api/playlist/subscribe", post(netease_playlist_subscribe))
+        .route("/api/playlist/create", any(netease_playlist_create))
+        .route("/api/playlist/add-song", any(netease_playlist_add_song))
+        .route("/api/playlist/subscribe", any(netease_playlist_subscribe))
         .route("/api/album/detail", get(netease_album_detail))
-        .route("/api/album/subscribe", post(netease_album_subscribe))
+        .route("/api/album/subscribe", any(netease_album_subscribe))
         .route("/api/album/subscribe/check", get(netease_album_subscribe_check))
         .route("/api/artist/detail", get(netease_artist_detail))
         .route("/api/song/comments", get(netease_song_comments).post(netease_post_comment))
-        .route("/api/song/comments/like", post(netease_comment_like))
-        .route("/api/song/like", post(netease_song_like))
+        .route("/api/song/comments/like", any(netease_comment_like))
+        .route("/api/song/like", any(netease_song_like))
+        .route("/api/like", any(netease_song_like))
         .route("/api/song/like/check", get(netease_song_like_check))
         .route("/api/podcast/search", get(netease_podcast_search))
         .route("/api/podcast/hot", get(netease_podcast_hot))
@@ -275,7 +399,7 @@ pub fn build_router(state: Arc<AppBackendState>) -> Router {
         .route("/api/kugou/playlist/tracks", get(kugou_playlist_tracks))
         .route("/api/kugou/song/like/check", get(kugou_like_check))
         .route("/api/kugou/song/like", post(kugou_like_toggle))
-        .route("/api/kugou/playlist/add-song", post(kugou_playlist_add_song))
+        .route("/api/kugou/playlist/add-song", any(kugou_playlist_add_song))
         // Qishui
         .route("/api/qishui/search", get(qishui_search))
         .route("/api/qishui/feed", get(qishui_feed))
@@ -300,6 +424,7 @@ pub fn build_router(state: Arc<AppBackendState>) -> Router {
         .route("/api/audio", get(proxy_audio))
         .route("/local-media/{kind}/{id}", get(serve_local_media))
         .route("/we-media/file/{id}", get(serve_we_media))
+        .route("/we-media/file/{id}/{*rel}", get(serve_we_media_nested))
         .route("/qishui-auth-proxy/{name}", get(serve_qishui_auth_asset))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -609,11 +734,102 @@ async fn beatmap_cache_get(
     }
 }
 
+fn extract_song_artist_text(song: &serde_json::Map<String, Value>) -> String {
+    if let Some(s) = song.get("artist").and_then(|v| v.as_str()) {
+        return s.trim().to_string();
+    }
+    let arr = song
+        .get("artists")
+        .or_else(|| song.get("ar"))
+        .or_else(|| song.get("artist"))
+        .and_then(|v| v.as_array());
+    if let Some(items) = arr {
+        let names: Vec<String> = items
+            .iter()
+            .filter_map(|item| match item {
+                Value::String(s) => Some(s.trim().to_string()),
+                Value::Object(obj) => obj
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_string()),
+                _ => None,
+            })
+            .filter(|s| !s.is_empty())
+            .collect();
+        return names.join(" / ");
+    }
+    String::new()
+}
+
+fn normalize_beatmap_cache_payload(body: &Value) -> Value {
+    let key = body
+        .get("key")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    let map_val = body
+        .get("map")
+        .or_else(|| body.get("beatMap"))
+        .filter(|v| v.is_object())
+        .cloned()
+        .unwrap_or(Value::Null);
+    let meta_obj = body.get("meta").and_then(|v| v.as_object());
+    let song_obj = body.get("song").and_then(|v| v.as_object());
+
+    let provider = body
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .or_else(|| meta_obj.and_then(|m| m.get("provider")).and_then(|v| v.as_str()))
+        .or_else(|| {
+            song_obj
+                .and_then(|s| s.get("provider").or_else(|| s.get("source")))
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or("");
+    let title = body
+        .get("title")
+        .and_then(|v| v.as_str())
+        .or_else(|| meta_obj.and_then(|m| m.get("title")).and_then(|v| v.as_str()))
+        .or_else(|| {
+            song_obj
+                .and_then(|s| s.get("title").or_else(|| s.get("name")))
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or("");
+    let artist = body
+        .get("artist")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            meta_obj
+                .and_then(|m| m.get("artist"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .or_else(|| song_obj.map(extract_song_artist_text))
+        .unwrap_or_default();
+    let mode = body
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .or_else(|| meta_obj.and_then(|m| m.get("mode")).and_then(|v| v.as_str()))
+        .unwrap_or("mr");
+
+    json!({
+        "key": key,
+        "provider": provider,
+        "title": title,
+        "artist": artist,
+        "mode": mode,
+        "map": map_val,
+    })
+}
+
 async fn beatmap_cache_post(
     State(state): State<Arc<AppBackendState>>,
     Json(body): Json<Value>,
 ) -> Response {
-    match state.config.write_beatmap_cache(&body) {
+    let normalized = normalize_beatmap_cache_payload(&body);
+    match state.config.write_beatmap_cache(&normalized) {
         Ok(res) => ok_json(json!(res)),
         Err(err) => ok_json(json!({
             "ok": false,
@@ -732,15 +948,52 @@ async fn cuefield_feedback_post(
     }
 }
 
-async fn podcast_dj_beatmap(Json(body): Json<Value>) -> Response {
-    let url = body.get("audioUrl").or_else(|| body.get("url")).and_then(|v| v.as_str()).unwrap_or("");
-    let duration_sec = body.get("durationSec").or_else(|| body.get("duration")).and_then(|v| v.as_f64()).unwrap_or(0.0);
-    if url.trim().is_empty() {
+async fn podcast_dj_beatmap(
+    Query(q): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Response {
+    let params = merge_query_and_body(&q, &body);
+    let url = params
+        .get("url")
+        .or_else(|| params.get("audioUrl"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let duration_sec = json_f64(
+        params.get("duration").or_else(|| params.get("durationSec")),
+        0.0,
+    )
+    .max(0.0);
+    let intro_only = match params.get("intro") {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => n.as_f64().is_some_and(|f| f > 0.0),
+        Some(Value::String(s)) => {
+            let trimmed = s.trim().to_ascii_lowercase();
+            if let Ok(num) = trimmed.parse::<f64>() {
+                num > 0.0
+            } else {
+                matches!(trimmed.as_str(), "true" | "yes" | "on")
+            }
+        }
+        _ => false,
+    };
+    if url.is_empty() {
         return err_json(StatusCode::BAD_REQUEST, "MISSING_AUDIO_URL");
     }
-    match analyze_podcast_dj_stream(url, duration_sec).await {
+    match analyze_podcast_dj_stream_with_options(url, duration_sec, intro_only).await {
         Ok(map) => ok_json(json!({ "ok": true, "map": map })),
         Err(e) => err_json(StatusCode::BAD_GATEWAY, e),
+    }
+}
+
+fn extract_listen_report_song_id(provider: &str, song: Option<&serde_json::Map<String, Value>>) -> String {
+    let Some(s) = song else {
+        return String::new();
+    };
+    match provider {
+        "qq" => json_id_str(s.get("mid").or_else(|| s.get("songmid")).or_else(|| s.get("id"))),
+        "kugou" => json_id_str(s.get("hash").or_else(|| s.get("fileHash")).or_else(|| s.get("id"))),
+        _ => json_id_str(s.get("id").or_else(|| s.get("providerSongId"))),
     }
 }
 
@@ -748,47 +1001,159 @@ async fn listen_report(
     State(state): State<Arc<AppBackendState>>,
     Json(body): Json<Value>,
 ) -> Response {
-    let provider = body
+    let song_obj = body.get("song").and_then(|v| v.as_object());
+    let provider_raw = body
         .get("provider")
         .and_then(|v| v.as_str())
+        .or_else(|| {
+            song_obj.and_then(|s| {
+                s.get("provider")
+                    .or_else(|| s.get("source"))
+                    .or_else(|| s.get("sourceKey"))
+                    .or_else(|| s.get("type"))
+                    .or_else(|| s.get("resolvedPlaybackProvider"))
+                    .and_then(|v| v.as_str())
+            })
+        })
         .unwrap_or("netease");
-    if provider != "netease" {
+    let provider = provider_raw.trim().to_ascii_lowercase();
+
+    let mut song_id = json_id_str(body.get("id"));
+    if song_id.is_empty() {
+        song_id = extract_listen_report_song_id(&provider, song_obj);
+    }
+    if song_id.is_empty() {
         return ok_json(json!({
             "accepted": false,
             "platformSubmitted": false,
+            "eligible": false,
             "provider": provider,
+            "reason": "MISSING_SONG_ID",
+        }));
+    }
+
+    let ineligible_song = song_obj.is_some_and(|s| {
+        let typ = s.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let src = s.get("source").and_then(|v| v.as_str()).unwrap_or("");
+        let trial = s.get("trial").and_then(|v| v.as_bool()).unwrap_or(false);
+        typ == "local" || typ == "podcast" || src == "podcast" || trial
+    });
+
+    let has_listen_ms = body.get("listenMs").is_some();
+    let listen_ms = if has_listen_ms {
+        json_f64(body.get("listenMs"), 0.0)
+            .clamp(0.0, 12.0 * 3600.0 * 1000.0)
+            .round() as u64
+    } else {
+        (json_f64(body.get("time"), 0.0).clamp(0.0, 12.0 * 3600.0) * 1000.0).round() as u64
+    };
+    let duration_ms = json_f64(body.get("durationMs"), 0.0)
+        .clamp(0.0, 12.0 * 3600.0 * 1000.0)
+        .round() as u64;
+    let capped_listen_ms = if duration_ms > 0 {
+        listen_ms.min(duration_ms + 2500)
+    } else {
+        listen_ms
+    };
+    let required_ms = if duration_ms > 0 {
+        let calc = if duration_ms <= 30_000 {
+            (duration_ms as f64 * 0.8).ceil() as u64
+        } else {
+            ((duration_ms as f64 * 0.5).ceil() as u64).min(30_000)
+        };
+        calc.max(5_000)
+    } else if has_listen_ms {
+        30_000
+    } else {
+        5_000
+    };
+
+    if ineligible_song || capped_listen_ms < required_ms {
+        return ok_json(json!({
+            "accepted": false,
+            "platformSubmitted": false,
+            "eligible": false,
+            "provider": provider,
+            "songId": song_id,
+            "listenMs": capped_listen_ms,
+            "durationMs": duration_ms,
+            "requiredMs": required_ms,
+            "reason": "LISTEN_REPORT_NOT_ELIGIBLE",
+        }));
+    }
+
+    if provider != "netease" && provider != "qishui" {
+        return ok_json(json!({
+            "accepted": false,
+            "platformSubmitted": false,
+            "eligible": true,
+            "provider": provider,
+            "songId": song_id,
             "reason": "UNSUPPORTED_PROVIDER",
         }));
     }
-    let id = body.get("id").and_then(|v| v.as_str()).or_else(|| body.get("id").and_then(|v| v.as_i64().map(|_| ""))).unwrap_or("");
-    let song_id = if id.is_empty() {
-        body.get("id").map(|v| v.to_string()).unwrap_or_default().trim_matches('"').to_string()
-    } else {
-        id.to_string()
-    };
-    let source_id = body.get("sourceId").and_then(|v| v.as_str()).unwrap_or("");
-    let time_sec = body.get("time").and_then(|v| v.as_u64()).unwrap_or(0);
-    if song_id.is_empty() {
-        return ok_json(json!({ "accepted": false, "platformSubmitted": false, "reason": "MISSING_SONG_ID" }));
-    }
-    let session_id = body
-        .get("sessionId")
-        .and_then(|v| v.as_str())
-        .unwrap_or(&song_id)
-        .to_string();
 
-    let res = state.netease.scrobble(&song_id, source_id, time_sec).await;
+    let ctx_obj = body.get("context").and_then(|v| v.as_object());
+    let mut source_id = json_id_str(body.get("sourceId"));
+    if source_id.is_empty() {
+        if let Some(ctx) = ctx_obj {
+            source_id = json_id_str(
+                ctx.get("playlistId")
+                    .or_else(|| ctx.get("id"))
+                    .or_else(|| ctx.get("sourceId")),
+            );
+        }
+    }
+    let time_sec = if body.get("time").is_some() {
+        (json_f64(body.get("time"), 0.0).round() as u64).max(1)
+    } else {
+        (capped_listen_ms / 1000).max(1)
+    };
+    let raw_session = json_id_str(body.get("sessionId"));
+    let session_id = if raw_session.is_empty() {
+        song_id.clone()
+    } else {
+        raw_session
+    };
+
+    let journal_key = format!("{provider}:{session_id}");
+    {
+        let journal = state.listen_journal.lock().unwrap();
+        if let Some(prev) = journal
+            .get("entries")
+            .and_then(|e| e.get(&journal_key))
+            .filter(|p| p.get("ok").and_then(|v| v.as_bool()) == Some(true))
+        {
+            return ok_json(json!({
+                "accepted": true,
+                "duplicate": true,
+                "platformSubmitted": true,
+                "eligible": true,
+                "provider": provider,
+                "songId": song_id,
+                "sessionId": session_id,
+                "previous": prev,
+            }));
+        }
+    }
+
+    let res = if provider == "netease" {
+        state.netease.scrobble(&song_id, &source_id, time_sec).await
+    } else {
+        state.qishui.report_recently_played(&song_id).await
+    };
     let submitted = res.is_ok();
     {
         let mut journal = state.listen_journal.lock().unwrap();
         if let Some(entries) = journal.get_mut("entries").and_then(|e| e.as_object_mut()) {
             entries.insert(
-                format!("netease:{session_id}"),
+                journal_key,
                 json!({
-                    "provider": "netease",
+                    "provider": provider,
                     "submittedAt": chrono::Utc::now().timestamp_millis(),
                     "songId": song_id,
                     "time": time_sec,
+                    "listenMs": capped_listen_ms,
                     "ok": submitted,
                 }),
             );
@@ -802,8 +1167,25 @@ async fn listen_report(
         let _ = write_json_pretty_atomic(&state.config.paths().listen_sync_file, &*journal);
     }
     match res {
-        Ok(val) => ok_json(json!({ "accepted": true, "platformSubmitted": true, "body": val })),
-        Err(e) => ok_json(json!({ "accepted": false, "platformSubmitted": false, "error": e })),
+        Ok(val) => ok_json(json!({
+            "accepted": true,
+            "platformSubmitted": true,
+            "eligible": true,
+            "provider": provider,
+            "songId": song_id,
+            "sessionId": session_id,
+            "listenMs": capped_listen_ms,
+            "durationMs": duration_ms,
+            "body": val,
+        })),
+        Err(e) => ok_json(json!({
+            "accepted": false,
+            "platformSubmitted": false,
+            "eligible": true,
+            "provider": provider,
+            "songId": song_id,
+            "error": e,
+        })),
     }
 }
 
@@ -1009,11 +1391,18 @@ async fn netease_playlist_tracks(
 
 async fn netease_playlist_create(
     State(state): State<Arc<AppBackendState>>,
-    Json(body): Json<Value>,
+    Query(q): Query<HashMap<String, String>>,
+    body: Bytes,
 ) -> Response {
-    let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("");
-    let privacy = body.get("privacy").and_then(|v| v.as_str()).unwrap_or("0");
-    match state.netease.playlist_create(name, privacy).await {
+    let params = merge_query_and_body(&q, &body);
+    let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let privacy_str = json_id_str(params.get("privacy"));
+    let privacy = if privacy_str.is_empty() {
+        "0".to_string()
+    } else {
+        privacy_str
+    };
+    match state.netease.playlist_create(name, &privacy).await {
         Ok(v) => ok_json(v),
         Err(e) => err_json(StatusCode::BAD_GATEWAY, e),
     }
@@ -1021,11 +1410,24 @@ async fn netease_playlist_create(
 
 async fn netease_playlist_add_song(
     State(state): State<Arc<AppBackendState>>,
-    Json(body): Json<Value>,
+    Query(q): Query<HashMap<String, String>>,
+    body: Bytes,
 ) -> Response {
-    let pid = body.get("pid").and_then(|v| v.as_str()).unwrap_or("");
-    let ids = body.get("tracks").or_else(|| body.get("ids")).and_then(|v| v.as_str()).unwrap_or("");
-    match state.netease.playlist_add_song(pid, ids).await {
+    let params = merge_query_and_body(&q, &body);
+    let has_explicit_pid = params.get("pid").is_some() || params.get("playlistId").is_some();
+    let pid = json_id_str(
+        params
+            .get("pid")
+            .or_else(|| params.get("playlistId"))
+            .or_else(|| params.get("id")),
+    );
+    let ids = json_id_str(
+        params
+            .get("tracks")
+            .or_else(|| params.get("ids"))
+            .or_else(|| if has_explicit_pid { params.get("id") } else { None }),
+    );
+    match state.netease.playlist_add_song(&pid, &ids).await {
         Ok(v) => ok_json(v),
         Err(e) => err_json(StatusCode::BAD_GATEWAY, e),
     }
@@ -1033,13 +1435,23 @@ async fn netease_playlist_add_song(
 
 async fn netease_playlist_subscribe(
     State(state): State<Arc<AppBackendState>>,
-    Json(body): Json<Value>,
+    Query(q): Query<HashMap<String, String>>,
+    body: Bytes,
 ) -> Response {
-    let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
-    let sub = body.get("t").and_then(|v| v.as_i64()).map(|n| n == 1)
-        .or_else(|| body.get("subscribed").and_then(|v| v.as_bool()))
-        .unwrap_or(true);
-    match state.netease.playlist_subscribe(id, sub).await {
+    let params = merge_query_and_body(&q, &body);
+    let id = json_id_str(params.get("id").or_else(|| params.get("playlistId")));
+    let sub = if let Some(t) = params.get("t") {
+        parse_action_toggle(Some(t), true)
+    } else {
+        json_bool(
+            params
+                .get("subscribe")
+                .or_else(|| params.get("subscribed"))
+                .or_else(|| params.get("collected")),
+            true,
+        )
+    };
+    match state.netease.playlist_subscribe(&id, sub).await {
         Ok(v) => ok_json(v),
         Err(e) => err_json(StatusCode::BAD_GATEWAY, e),
     }
@@ -1059,11 +1471,23 @@ async fn netease_album_detail(
 
 async fn netease_album_subscribe(
     State(state): State<Arc<AppBackendState>>,
-    Json(body): Json<Value>,
+    Query(q): Query<HashMap<String, String>>,
+    body: Bytes,
 ) -> Response {
-    let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
-    let sub = body.get("subscribed").and_then(|v| v.as_bool()).unwrap_or(true);
-    match state.netease.album_subscribe(id, sub).await {
+    let params = merge_query_and_body(&q, &body);
+    let id = json_id_str(params.get("id").or_else(|| params.get("albumId")));
+    let sub = if let Some(t) = params.get("t") {
+        parse_action_toggle(Some(t), true)
+    } else {
+        json_bool(
+            params
+                .get("subscribe")
+                .or_else(|| params.get("subscribed"))
+                .or_else(|| params.get("collected")),
+            true,
+        )
+    };
+    match state.netease.album_subscribe(&id, sub).await {
         Ok(v) => ok_json(v),
         Err(e) => err_json(StatusCode::BAD_GATEWAY, e),
     }
@@ -1111,12 +1535,19 @@ async fn netease_song_comments(
 
 async fn netease_post_comment(
     State(state): State<Arc<AppBackendState>>,
-    Json(body): Json<Value>,
+    Query(q): Query<HashMap<String, String>>,
+    body: Bytes,
 ) -> Response {
-    let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
-    let content = body.get("content").and_then(|v| v.as_str()).unwrap_or("");
-    let thread_id = body.get("commentId").and_then(|v| v.as_str());
-    match state.netease.post_comment(id, content, thread_id).await {
+    let params = merge_query_and_body(&q, &body);
+    let id = json_id_str(params.get("id"));
+    let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    let reply_to = json_id_str(params.get("replyTo").or_else(|| params.get("commentId")));
+    let thread_id = if reply_to.is_empty() {
+        None
+    } else {
+        Some(reply_to.as_str())
+    };
+    match state.netease.post_comment(&id, content, thread_id).await {
         Ok(v) => ok_json(v),
         Err(e) => err_json(StatusCode::BAD_GATEWAY, e),
     }
@@ -1124,12 +1555,18 @@ async fn netease_post_comment(
 
 async fn netease_comment_like(
     State(state): State<Arc<AppBackendState>>,
-    Json(body): Json<Value>,
+    Query(q): Query<HashMap<String, String>>,
+    body: Bytes,
 ) -> Response {
-    let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
-    let cid = body.get("cid").and_then(|v| v.as_str()).unwrap_or("");
-    let liked = body.get("like").and_then(|v| v.as_bool()).unwrap_or(true);
-    match state.netease.comment_like(id, cid, liked).await {
+    let params = merge_query_and_body(&q, &body);
+    let id = json_id_str(params.get("id"));
+    let cid = json_id_str(params.get("cid").or_else(|| params.get("commentId")));
+    let liked = if let Some(t) = params.get("t") {
+        parse_action_toggle(Some(t), true)
+    } else {
+        json_bool(params.get("like").or_else(|| params.get("liked")), true)
+    };
+    match state.netease.comment_like(&id, &cid, liked).await {
         Ok(v) => ok_json(v),
         Err(e) => err_json(StatusCode::BAD_GATEWAY, e),
     }
@@ -1137,11 +1574,13 @@ async fn netease_comment_like(
 
 async fn netease_song_like(
     State(state): State<Arc<AppBackendState>>,
-    Json(body): Json<Value>,
+    Query(q): Query<HashMap<String, String>>,
+    body: Bytes,
 ) -> Response {
-    let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
-    let like = body.get("like").and_then(|v| v.as_bool()).unwrap_or(true);
-    match state.netease.like_song(id, like).await {
+    let params = merge_query_and_body(&q, &body);
+    let id = json_id_str(params.get("id"));
+    let like = json_bool(params.get("like").or_else(|| params.get("liked")), true);
+    match state.netease.like_song(&id, like).await {
         Ok(v) => ok_json(v),
         Err(e) => err_json(StatusCode::BAD_GATEWAY, e),
     }
@@ -1204,8 +1643,11 @@ async fn netease_podcast_programs(
     let rid = q.get("id").or_else(|| q.get("rid")).cloned().unwrap_or_default();
     let limit = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(40);
     let offset = q.get("offset").and_then(|s| s.parse().ok()).unwrap_or(0);
-    let _asc = q.get("asc").map(|s| s == "1" || s == "true").unwrap_or(false);
-    match state.netease.podcast_programs(&rid, limit, offset).await {
+    let asc = q
+        .get("asc")
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    match state.netease.podcast_programs(&rid, limit, offset, asc).await {
         Ok(v) => ok_json(v),
         Err(e) => err_json(StatusCode::BAD_GATEWAY, e),
     }
@@ -1242,12 +1684,35 @@ async fn netease_login_cookie(
     State(state): State<Arc<AppBackendState>>,
     Json(body): Json<Value>,
 ) -> Response {
-    let cookie = body.get("cookie").and_then(|v| v.as_str()).unwrap_or("");
-    if let Err(e) = state.netease.set_cookie(cookie) {
+    let raw = body
+        .get("cookie")
+        .or_else(|| body.get("data"))
+        .or_else(|| body.get("text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let normalized = crate::providers::normalize_cookie_header(raw);
+    let parsed = crate::providers::parse_cookie_string(&normalized);
+    if normalized.is_empty() || parsed.get("MUSIC_U").is_none_or(|v| v.trim().is_empty()) {
+        return json_status(
+            StatusCode::BAD_REQUEST,
+            json!({
+                "loggedIn": false,
+                "error": "INVALID_NETEASE_COOKIE",
+                "message": "网易云 cookie 缺少 MUSIC_U",
+            }),
+        );
+    }
+    if let Err(e) = state.netease.set_cookie(&normalized) {
         return err_json(StatusCode::BAD_REQUEST, e);
     }
     match state.netease.login_status().await {
-        Ok(v) => ok_json(v),
+        Ok(mut v) => {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("saved".to_string(), json!(true));
+                obj.insert("hasCookie".to_string(), json!(true));
+            }
+            ok_json(v)
+        }
         Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
 }
@@ -1362,12 +1827,50 @@ async fn qq_login_cookie(
     State(state): State<Arc<AppBackendState>>,
     Json(body): Json<Value>,
 ) -> Response {
-    let cookie = body.get("cookie").and_then(|v| v.as_str()).unwrap_or("");
-    if let Err(e) = state.qq.set_cookie(cookie) {
+    let raw = body
+        .get("cookie")
+        .or_else(|| body.get("data"))
+        .or_else(|| body.get("text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let normalized = crate::providers::qq::normalize_qq_cookie_input(raw);
+    let obj = crate::providers::parse_cookie_string(&normalized);
+    let uin = crate::providers::qq::qq_cookie_uin(&obj);
+    let playback_key = crate::providers::qq::qq_cookie_playback_key(&obj);
+    if normalized.is_empty() || uin.is_empty() || playback_key.is_empty() {
+        let has_web_session =
+            !uin.is_empty() && !crate::providers::qq::qq_cookie_music_key(&obj).is_empty();
+        let error = if has_web_session {
+            "QQ_PLAYBACK_AUTH_INCOMPLETE"
+        } else {
+            "INVALID_QQ_COOKIE"
+        };
+        let message = if has_web_session {
+            "QQ 账号验证已完成，但 QQ 音乐播放授权尚未生成，请重新打开官方登录窗口完成授权"
+        } else {
+            "QQ cookie 缺少 uin 或有效 QQ 音乐播放票据"
+        };
+        return json_status(
+            StatusCode::BAD_REQUEST,
+            json!({
+                "provider": "qq",
+                "loggedIn": false,
+                "partial": has_web_session,
+                "error": error,
+                "message": message,
+            }),
+        );
+    }
+    if let Err(e) = state.qq.set_cookie(&normalized) {
         return err_json(StatusCode::BAD_REQUEST, e);
     }
     match state.qq.login_status(true, true).await {
-        Ok(v) => ok_json(v),
+        Ok(mut v) => {
+            if let Some(map) = v.as_object_mut() {
+                map.insert("saved".to_string(), json!(true));
+            }
+            ok_json(v)
+        }
         Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
 }
@@ -1529,12 +2032,48 @@ async fn kugou_login_cookie(
     State(state): State<Arc<AppBackendState>>,
     Json(body): Json<Value>,
 ) -> Response {
-    let cookie = body.get("cookie").and_then(|v| v.as_str()).unwrap_or("");
-    if let Err(e) = state.kugou.set_cookie(cookie) {
+    let raw = body
+        .get("cookie")
+        .or_else(|| body.get("data"))
+        .or_else(|| body.get("text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let normalized = {
+        let n = crate::providers::normalize_cookie_header(raw);
+        if n.is_empty() {
+            raw.trim().to_string()
+        } else {
+            n
+        }
+    };
+    let auth = crate::providers::kugou::extract_kugou_auth(&normalized);
+    let obj = crate::providers::parse_cookie_string(&normalized);
+    let has_mid = obj.get("kg_mid").is_some_and(|v| !v.is_empty());
+    if normalized.is_empty() || (!auth.logged_in && !has_mid) {
+        return json_status(
+            StatusCode::BAD_REQUEST,
+            json!({
+                "provider": "kugou",
+                "loggedIn": false,
+                "error": "INVALID_KUGOU_COOKIE",
+                "message": "酷狗 cookie 无效或缺少登录标识",
+            }),
+        );
+    }
+    if let Err(e) = state.kugou.set_cookie(&normalized) {
         return err_json(StatusCode::BAD_REQUEST, e);
     }
     match state.kugou.login_status().await {
-        Ok(v) => ok_json(v),
+        Ok(mut v) => {
+            if let Some(map) = v.as_object_mut() {
+                map.insert("saved".to_string(), json!(true));
+                map.insert(
+                    "partial".to_string(),
+                    json!(auth.logged_in && !auth.playback_ready),
+                );
+            }
+            ok_json(v)
+        }
         Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
 }
@@ -1555,7 +2094,11 @@ async fn kugou_playlist_tracks(
     State(state): State<Arc<AppBackendState>>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let id = q.get("id").cloned().unwrap_or_default();
+    let id = q
+        .get("id")
+        .or_else(|| q.get("global_collection_id"))
+        .cloned()
+        .unwrap_or_default();
     let limit = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(50);
     let offset = q.get("offset").and_then(|s| s.parse().ok()).unwrap_or(0);
     let paged = q
@@ -1568,6 +2111,10 @@ async fn kugou_playlist_tracks(
     }
 }
 
+fn is_kugou_auth_required_response(v: &Value) -> bool {
+    v.get("error").and_then(|e| e.as_str()) == Some("KUGOU_AUTH_REQUIRED")
+}
+
 async fn kugou_like_check(
     State(state): State<Arc<AppBackendState>>,
     Query(q): Query<HashMap<String, String>>,
@@ -1575,9 +2122,11 @@ async fn kugou_like_check(
     let hashes: Vec<String> = q
         .get("hashes")
         .or_else(|| q.get("ids"))
+        .or_else(|| q.get("hash"))
         .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
         .unwrap_or_default();
     match state.kugou.like_check(&hashes).await {
+        Ok(v) if is_kugou_auth_required_response(&v) => json_status(StatusCode::UNAUTHORIZED, v),
         Ok(v) => ok_json(v),
         Err(e) => err_json(StatusCode::BAD_GATEWAY, e),
     }
@@ -1585,10 +2134,13 @@ async fn kugou_like_check(
 
 async fn kugou_like_toggle(
     State(state): State<Arc<AppBackendState>>,
-    Json(body): Json<Value>,
+    Query(q): Query<HashMap<String, String>>,
+    body: Bytes,
 ) -> Response {
-    let like = body.get("like").and_then(|v| v.as_bool()).unwrap_or(true);
-    match state.kugou.like_toggle(&body, like).await {
+    let params = merge_query_and_body(&q, &body);
+    let like = json_bool(params.get("like"), true);
+    match state.kugou.like_toggle(&params, like).await {
+        Ok(v) if is_kugou_auth_required_response(&v) => json_status(StatusCode::UNAUTHORIZED, v),
         Ok(v) => ok_json(v),
         Err(e) => err_json(StatusCode::BAD_GATEWAY, e),
     }
@@ -1596,11 +2148,19 @@ async fn kugou_like_toggle(
 
 async fn kugou_playlist_add_song(
     State(state): State<Arc<AppBackendState>>,
-    Json(body): Json<Value>,
+    Query(q): Query<HashMap<String, String>>,
+    body: Bytes,
 ) -> Response {
-    let list_id = body.get("listId").or_else(|| body.get("id")).and_then(|v| v.as_str()).unwrap_or("");
-    let song = body.get("song").unwrap_or(&body);
-    match state.kugou.playlist_add_song(list_id, song).await {
+    let params = merge_query_and_body(&q, &body);
+    let list_id = json_id_str(
+        params
+            .get("listId")
+            .or_else(|| params.get("pid"))
+            .or_else(|| params.get("id")),
+    );
+    let song = params.get("song").unwrap_or(&params);
+    match state.kugou.playlist_add_song(&list_id, song).await {
+        Ok(v) if is_kugou_auth_required_response(&v) => json_status(StatusCode::UNAUTHORIZED, v),
         Ok(v) => ok_json(v),
         Err(e) => err_json(StatusCode::BAD_GATEWAY, e),
     }
@@ -1714,9 +2274,9 @@ async fn qishui_song_like(
     State(state): State<Arc<AppBackendState>>,
     Json(body): Json<Value>,
 ) -> Response {
-    let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
-    let liked = body.get("like").or_else(|| body.get("liked")).and_then(|v| v.as_bool()).unwrap_or(true);
-    match state.qishui.song_like(id, liked).await {
+    let id = json_id_str(body.get("id"));
+    let liked = json_bool(body.get("like").or_else(|| body.get("liked")), true);
+    match state.qishui.song_like(&id, liked).await {
         Ok(v) => ok_json(v),
         Err(e) => err_json(StatusCode::BAD_GATEWAY, e),
     }
@@ -1726,9 +2286,9 @@ async fn qishui_playlist_collect(
     State(state): State<Arc<AppBackendState>>,
     Json(body): Json<Value>,
 ) -> Response {
-    let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
-    let collected = body.get("collected").and_then(|v| v.as_bool()).unwrap_or(true);
-    match state.qishui.playlist_collect(id, collected).await {
+    let id = json_id_str(body.get("id").or_else(|| body.get("playlistId")));
+    let collected = json_bool(body.get("collected").or_else(|| body.get("subscribe")), true);
+    match state.qishui.playlist_collect(&id, collected).await {
         Ok(v) => ok_json(v),
         Err(e) => err_json(StatusCode::BAD_GATEWAY, e),
     }
@@ -1738,9 +2298,9 @@ async fn qishui_playlist_add_song(
     State(state): State<Arc<AppBackendState>>,
     Json(body): Json<Value>,
 ) -> Response {
-    let pid = body.get("playlistId").or_else(|| body.get("id")).and_then(|v| v.as_str()).unwrap_or("");
-    let tid = body.get("trackId").or_else(|| body.get("songId")).and_then(|v| v.as_str()).unwrap_or("");
-    match state.qishui.playlist_add_song(pid, tid).await {
+    let pid = json_id_str(body.get("playlistId").or_else(|| body.get("pid")).or_else(|| body.get("id")));
+    let tid = json_id_str(body.get("trackId").or_else(|| body.get("songId")));
+    match state.qishui.playlist_add_song(&pid, &tid).await {
         Ok(v) => ok_json(v),
         Err(e) => err_json(StatusCode::BAD_GATEWAY, e),
     }
@@ -1750,9 +2310,9 @@ async fn qishui_album_collect(
     State(state): State<Arc<AppBackendState>>,
     Json(body): Json<Value>,
 ) -> Response {
-    let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
-    let collected = body.get("collected").and_then(|v| v.as_bool()).unwrap_or(true);
-    match state.qishui.album_collect(id, collected).await {
+    let id = json_id_str(body.get("id").or_else(|| body.get("albumId")));
+    let collected = json_bool(body.get("collected").or_else(|| body.get("subscribe")), true);
+    match state.qishui.album_collect(&id, collected).await {
         Ok(v) => ok_json(v),
         Err(e) => err_json(StatusCode::BAD_GATEWAY, e),
     }
@@ -1779,9 +2339,9 @@ async fn qishui_create_comment(
     State(state): State<Arc<AppBackendState>>,
     Json(body): Json<Value>,
 ) -> Response {
-    let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let id = json_id_str(body.get("id"));
     let text = body.get("content").or_else(|| body.get("text")).and_then(|v| v.as_str()).unwrap_or("");
-    match state.qishui.create_comment(id, text).await {
+    match state.qishui.create_comment(&id, text).await {
         Ok(v) => ok_json(v),
         Err(e) => err_json(StatusCode::BAD_GATEWAY, e),
     }
@@ -2081,16 +2641,23 @@ async fn serve_local_media(
     serve_file_with_range(path, mime, range_hdr).await
 }
 
-async fn serve_we_media(
-    State(state): State<Arc<AppBackendState>>,
-    AxumPath(id): AxumPath<String>,
+async fn serve_we_media_resolved(
+    state: Arc<AppBackendState>,
+    id: &str,
+    rel: &str,
+    cap: &str,
     headers: HeaderMap,
-    Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let rel = q.get("path").map(String::as_str).unwrap_or("");
+    let expected = state.wallpaper_engine.list_projects(false).media_token;
+    if cap != expected {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let decoded_rel = percent_encoding::percent_decode_str(rel)
+        .decode_utf8_lossy()
+        .into_owned();
     let Ok(path) = state
         .wallpaper_engine
-        .resolve_project_file(&id, rel, WallpaperFileCapability::AnySafe)
+        .resolve_project_file(id, &decoded_rel, WallpaperFileCapability::AnySafe)
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -2103,12 +2670,47 @@ async fn serve_we_media(
             "png" => Some("image/png"),
             "webp" => Some("image/webp"),
             "gif" => Some("image/gif"),
+            "pkg" | "pak" => Some("application/octet-stream"),
             _ => None,
         })
         .unwrap_or("application/octet-stream")
         .to_string();
     let range_hdr = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
     serve_file_with_range(path, mime, range_hdr).await
+}
+
+async fn serve_we_media(
+    State(state): State<Arc<AppBackendState>>,
+    AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let rel = q.get("path").map(String::as_str).unwrap_or("");
+    let cap = q
+        .get("cap")
+        .or_else(|| q.get("token"))
+        .map(String::as_str)
+        .unwrap_or("");
+    serve_we_media_resolved(state, &id, rel, cap, headers).await
+}
+
+async fn serve_we_media_nested(
+    State(state): State<Arc<AppBackendState>>,
+    AxumPath((id, rel_path)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let rel = q
+        .get("path")
+        .map(String::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(&rel_path);
+    let cap = q
+        .get("cap")
+        .or_else(|| q.get("token"))
+        .map(String::as_str)
+        .unwrap_or("");
+    serve_we_media_resolved(state, &id, rel, cap, headers).await
 }
 
 async fn serve_qishui_auth_asset(
@@ -2334,5 +2936,396 @@ mod tests {
         );
         let slice = partial.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&slice[..], b"RIFF");
+    }
+
+    #[test]
+    fn json_id_str_and_param_helpers_handle_all_variants() {
+        assert_eq!(json_id_str(Some(&json!("  12345  "))), "12345");
+        assert_eq!(json_id_str(Some(&json!(9876543210u64))), "9876543210");
+        assert_eq!(json_id_str(Some(&json!(-42))), "-42");
+        assert_eq!(json_id_str(Some(&json!(2048.0))), "2048");
+        assert_eq!(json_id_str(Some(&json!({ "songId": 778899 }))), "778899");
+        assert_eq!(json_id_str(Some(&json!([111, "222", { "id": 333 }]))), "111,222,333");
+        assert_eq!(json_id_str(Some(&json!(true))), "");
+        assert_eq!(json_id_str(None), "");
+
+        assert!(json_bool(Some(&json!("1")), false));
+        assert!(json_bool(Some(&json!("true")), false));
+        assert!(!json_bool(Some(&json!("0")), true));
+        assert!(!json_bool(Some(&json!("false")), true));
+        assert!(!json_bool(Some(&json!(0)), true));
+        assert!(parse_action_toggle(Some(&json!(1)), false));
+        assert!(!parse_action_toggle(Some(&json!(2)), true));
+        assert!(!parse_action_toggle(Some(&json!("0")), true));
+
+        let mut q = HashMap::new();
+        q.insert("id".to_string(), "100".to_string());
+        q.insert("like".to_string(), "false".to_string());
+        let merged = merge_query_and_body(
+            &q,
+            &Bytes::from_static(br#"{"id":200,"replyTo":999}"#),
+        );
+        assert_eq!(json_id_str(merged.get("id")), "200");
+        assert_eq!(json_id_str(merged.get("replyTo")), "999");
+        assert!(!json_bool(merged.get("like"), true));
+    }
+
+    #[tokio::test]
+    async fn beatmap_cache_accepts_beatmap_and_song_alias() {
+        let (_tmp, state) = test_state();
+        let app = build_router(state);
+
+        let payload = serde_json::to_string(&json!({
+            "key": "qq:track_x",
+            "beatMap": {
+                "duration": 142.5,
+                "gridStep": 0.5,
+                "beats": []
+            },
+            "song": {
+                "provider": "qq",
+                "title": "Midnight Drive",
+                "artists": [{ "name": "Alice" }, { "name": "Bob" }]
+            }
+        }))
+        .unwrap();
+
+        let post_resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/beatmap/cache")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(post_resp.status(), StatusCode::OK);
+        let post_json: Value = serde_json::from_slice(
+            &post_resp.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(post_json["ok"], true);
+
+        let get_resp = app
+            .oneshot(
+                Request::get("/api/beatmap/cache?key=qq:track_x")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_resp.status(), StatusCode::OK);
+        let get_json: Value = serde_json::from_slice(
+            &get_resp.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(get_json["hit"], true);
+        assert_eq!(get_json["meta"]["provider"], "qq");
+        assert_eq!(get_json["meta"]["title"], "Midnight Drive");
+        assert_eq!(get_json["meta"]["artist"], "Alice / Bob");
+        assert_eq!(get_json["map"]["duration"], 142.5);
+    }
+
+    #[tokio::test]
+    async fn listen_report_validates_duration_and_payload_variants() {
+        let (_tmp, state) = test_state();
+        let app = build_router(state);
+
+        // 1. 原版 payload 有效播放时长不足
+        let short_legacy = serde_json::to_string(&json!({
+            "provider": "netease",
+            "song": { "id": 123456 },
+            "sessionId": "sess-0001",
+            "listenMs": 2000,
+            "durationMs": 200000
+        }))
+        .unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/listen/report")
+                    .header("content-type", "application/json")
+                    .body(Body::from(short_legacy))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let val: Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(val["accepted"], false);
+        assert_eq!(val["eligible"], false);
+        assert_eq!(val["reason"], "LISTEN_REPORT_NOT_ELIGIBLE");
+
+        // 2. 简化 payload 时长不足 (< 5s)
+        let short_new = serde_json::to_string(&json!({
+            "provider": "netease",
+            "id": 998877,
+            "time": 2,
+            "sessionId": "sess-0002"
+        }))
+        .unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/listen/report")
+                    .header("content-type", "application/json")
+                    .body(Body::from(short_new))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let val: Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(val["accepted"], false);
+        assert_eq!(val["reason"], "LISTEN_REPORT_NOT_ELIGIBLE");
+
+        // 3. 播客曲目不允许上报
+        let podcast_body = serde_json::to_string(&json!({
+            "provider": "netease",
+            "song": { "id": 555, "type": "podcast" },
+            "sessionId": "sess-0003",
+            "listenMs": 60000,
+            "durationMs": 120000
+        }))
+        .unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/listen/report")
+                    .header("content-type", "application/json")
+                    .body(Body::from(podcast_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let val: Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(val["accepted"], false);
+        assert_eq!(val["reason"], "LISTEN_REPORT_NOT_ELIGIBLE");
+
+        // 4. 不支持的平台
+        let qq_body = serde_json::to_string(&json!({
+            "provider": "qq",
+            "id": "001abc",
+            "time": 60,
+            "sessionId": "sess-0004"
+        }))
+        .unwrap();
+        let resp = app
+            .oneshot(
+                Request::post("/api/listen/report")
+                    .header("content-type", "application/json")
+                    .body(Body::from(qq_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let val: Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(val["accepted"], false);
+        assert_eq!(val["reason"], "UNSUPPORTED_PROVIDER");
+    }
+
+    #[tokio::test]
+    async fn login_cookie_validation_and_kugou_unauthorized_work() {
+        let (_tmp, state) = test_state();
+        assert!(state.gate.unlock("世界和平").unlocked);
+        let app = build_router(state);
+
+        // Netease cookie 缺 MUSIC_U -> 400
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/login/cookie")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"cookie":"__csrf=abc"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let val: Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(val["error"], "INVALID_NETEASE_COOKIE");
+
+        // QQ cookie 缺凭证 -> 400 INVALID_QQ_COOKIE
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/qq/login/cookie")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"cookie":""}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let val: Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(val["error"], "INVALID_QQ_COOKIE");
+
+        // QQ cookie 有网页会话但缺 playback key -> 400 QQ_PLAYBACK_AUTH_INCOMPLETE
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/qq/login/cookie")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"cookie":"uin=o123456789; skey=test_web_skey"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let val: Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(val["error"], "QQ_PLAYBACK_AUTH_INCOMPLETE");
+        assert_eq!(val["partial"], true);
+
+        // Kugou cookie 为空 -> 400 INVALID_KUGOU_COOKIE
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/kugou/login/cookie")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"cookie":"   "}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let val: Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(val["error"], "INVALID_KUGOU_COOKIE");
+
+        // Kugou 未登录调用 like/check、song/like、playlist/add-song -> 401
+        for req in [
+            Request::get("/api/kugou/song/like/check?hashes=abc")
+                .body(Body::empty())
+                .unwrap(),
+            Request::post("/api/kugou/song/like")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"hash":"abc","like":true}"#))
+                .unwrap(),
+            Request::get("/api/kugou/playlist/add-song?pid=100&hash=abc")
+                .body(Body::empty())
+                .unwrap(),
+        ] {
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            let val: Value =
+                serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(val["error"], "KUGOU_AUTH_REQUIRED");
+        }
+
+        // /api/podcast/dj-beatmap 支持 GET + POST 参数校验
+        let resp_get = app
+            .clone()
+            .oneshot(
+                Request::get("/api/podcast/dj-beatmap")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_get.status(), StatusCode::BAD_REQUEST);
+
+        let resp_post = app
+            .oneshot(
+                Request::post("/api/podcast/dj-beatmap")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"intro":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_post.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn we_media_serves_query_and_nested_paths_with_cap_check() {
+        let (tmp, state) = test_state();
+        let proj = tmp.path().join("wp_demo");
+        std::fs::create_dir_all(proj.join("sub")).unwrap();
+        std::fs::write(proj.join("sub").join("loop.mp4"), b"mp4-payload").unwrap();
+        std::fs::write(proj.join("preview.jpg"), b"jpg-payload").unwrap();
+        std::fs::write(
+            proj.join("project.json"),
+            json!({
+                "title": "Test WP",
+                "type": "video",
+                "file": "sub/loop.mp4",
+                "preview": "preview.jpg"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let snap = state.wallpaper_engine.add_directory(&proj).unwrap();
+        let id = snap.projects[0].id.clone();
+        let token = snap.media_token.clone();
+
+        let app = build_router(state);
+
+        // 错误 token -> 403
+        let bad = app
+            .clone()
+            .oneshot(
+                Request::get(&format!("/we-media/file/{id}?path=preview.jpg&cap=wrong"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::FORBIDDEN);
+
+        // 查询参数 path + token
+        let ok_preview = app
+            .clone()
+            .oneshot(
+                Request::get(&format!(
+                    "/we-media/file/{id}?path=preview.jpg&token={token}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok_preview.status(), StatusCode::OK);
+        assert_eq!(
+            ok_preview.into_body().collect().await.unwrap().to_bytes().as_ref(),
+            b"jpg-payload"
+        );
+
+        // 多段路径 + cap
+        let ok_nested = app
+            .clone()
+            .oneshot(
+                Request::get(&format!("/we-media/file/{id}/sub/loop.mp4?cap={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok_nested.status(), StatusCode::OK);
+        assert_eq!(
+            ok_nested.into_body().collect().await.unwrap().to_bytes().as_ref(),
+            b"mp4-payload"
+        );
+
+        // 路径穿越 -> 404
+        let traversal = app
+            .oneshot(
+                Request::get(&format!(
+                    "/we-media/file/{id}?path=../secret.mp4&cap={token}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(traversal.status(), StatusCode::NOT_FOUND);
     }
 }

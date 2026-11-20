@@ -16,6 +16,8 @@ const DEFAULT_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 const FULL_STREAM_QUALITY_LIMIT_SEC: f64 = 7200.0;
 const MAX_DOWNLOAD_BYTES: usize = 256 * 1024 * 1024;
 const MAX_RANGE_SAMPLE_BYTES: usize = 24 * 1024 * 1024;
+const INTRO_DECODE_MAX_SEC: f64 = 55.0;
+const INTRO_FETCH_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 fn now_epoch_ms() -> u64 {
     SystemTime::now()
@@ -672,6 +674,7 @@ fn decode_bytes_to_energy(
     bytes: &[u8],
     ext_hint: Option<&str>,
     duration_hint: f64,
+    max_decode_sec: Option<f64>,
 ) -> Result<DecodedEnergy, String> {
     if bytes.is_empty() {
         return Err("Empty audio bytes".to_string());
@@ -747,7 +750,12 @@ fn decode_bytes_to_energy(
     let mut chunks: usize = 0;
     let mut decoded_samples: usize = 0;
 
+    let mut reached_limit = false;
+
     loop {
+        if reached_limit {
+            break;
+        }
         let packet = match format.next_packet() {
             Ok(p) => p,
             Err(SymphoniaError::IoError(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -827,6 +835,12 @@ fn decode_bytes_to_energy(
                 frame_peak = 0.0;
                 frame_count = 0;
             }
+            if let Some(limit_sec) = max_decode_sec {
+                if effective_sr > 0.0 && (effective_samples as f64 / effective_sr) >= limit_sec {
+                    reached_limit = true;
+                    break;
+                }
+            }
             i += sample_step;
         }
     }
@@ -861,12 +875,22 @@ pub fn analyze_audio_bytes(
     ext_hint: Option<&str>,
     duration_hint: f64,
 ) -> Result<Value, String> {
+    analyze_audio_bytes_with_limit(bytes, ext_hint, duration_hint, None)
+}
+
+/// 解码内存中的音频字节流（支持可选的最大解码秒数限制，用于首段 intro 快速锁拍）。
+pub fn analyze_audio_bytes_with_limit(
+    bytes: &[u8],
+    ext_hint: Option<&str>,
+    duration_hint: f64,
+    max_decode_sec: Option<f64>,
+) -> Result<Value, String> {
     let hint_dur = if duration_hint.is_finite() && duration_hint > 0.0 {
         duration_hint
     } else {
         0.0
     };
-    let decoded = decode_bytes_to_energy(bytes, ext_hint, hint_dur)?;
+    let decoded = decode_bytes_to_energy(bytes, ext_hint, hint_dur, max_decode_sec)?;
     let duration = if decoded.duration > 0.0 {
         decoded.duration
     } else {
@@ -878,7 +902,24 @@ pub fn analyze_audio_bytes(
         decoded.hop_sec,
         duration,
     );
+    let intro_mode = max_decode_sec.is_some();
     if let Some(obj) = map.as_object_mut() {
+        if intro_mode {
+            if obj
+                .get("tempoSource")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s != "podcast-dj-server-empty")
+            {
+                obj.insert(
+                    "tempoSource".to_string(),
+                    json!("podcast-dj-server-intro-offline"),
+                );
+            }
+            obj.insert("partial".to_string(), json!(true));
+            obj.insert("introOnly".to_string(), json!(true));
+            obj.insert("partialUntilSec".to_string(), json!(duration));
+            obj.insert("fullDuration".to_string(), json!(hint_dur));
+        }
         obj.insert(
             "decode".to_string(),
             json!({
@@ -889,6 +930,8 @@ pub fn analyze_audio_bytes(
                 "frames": decoded.low_energy.len(),
                 "requestedDurationSec": hint_dur,
                 "effectiveDurationSec": decoded.duration,
+                "intro": intro_mode,
+                "partialUntilSec": if intro_mode { json!(duration) } else { Value::Null },
             }),
         );
     }
@@ -939,6 +982,16 @@ async fn fetch_audio_bytes(
     range_header: Option<&str>,
     max_bytes: usize,
 ) -> Result<(Vec<u8>, Option<String>), String> {
+    fetch_audio_bytes_with_mode(client, audio_url, range_header, max_bytes, range_header.is_some()).await
+}
+
+async fn fetch_audio_bytes_with_mode(
+    client: &reqwest::Client,
+    audio_url: &str,
+    range_header: Option<&str>,
+    max_bytes: usize,
+    truncate_on_limit: bool,
+) -> Result<(Vec<u8>, Option<String>), String> {
     let mut req = client
         .get(audio_url)
         .header(reqwest::header::USER_AGENT, DEFAULT_UA)
@@ -959,9 +1012,11 @@ async fn fetch_audio_bytes(
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    if let Some(cl) = resp.content_length() {
-        if cl as usize > max_bytes {
-            return Err(format!("Audio stream exceeds max byte limit ({cl} > {max_bytes})"));
+    if !truncate_on_limit {
+        if let Some(cl) = resp.content_length() {
+            if cl as usize > max_bytes {
+                return Err(format!("Audio stream exceeds max byte limit ({cl} > {max_bytes})"));
+            }
         }
     }
 
@@ -970,7 +1025,7 @@ async fn fetch_audio_bytes(
     while let Some(chunk_res) = stream.next().await {
         let chunk = chunk_res.map_err(|e| format!("Audio stream read failed: {e}"))?;
         if bytes.len() + chunk.len() > max_bytes {
-            if range_header.is_some() {
+            if truncate_on_limit {
                 let remaining = max_bytes - bytes.len();
                 bytes.extend_from_slice(&chunk[..remaining]);
                 break;
@@ -1424,6 +1479,15 @@ async fn analyze_podcast_dj_range_samples(
 
 /// 异步拉取远程 HTTP/HTTPS 音频流并分析节奏节拍图谱（支持长音频 Range 采样与超时/字节上限防护）。
 pub async fn analyze_podcast_dj_stream(audio_url: &str, duration_sec: f64) -> Result<Value, String> {
+    analyze_podcast_dj_stream_with_options(audio_url, duration_sec, false).await
+}
+
+/// 异步拉取远程 HTTP/HTTPS 音频流并分析节奏节拍图谱；`intro_only == true` 时仅解码分析前约 55 秒以加速首段锁拍。
+pub async fn analyze_podcast_dj_stream_with_options(
+    audio_url: &str,
+    duration_sec: f64,
+    intro_only: bool,
+) -> Result<Value, String> {
     let trimmed = audio_url.trim();
     let lower = trimmed.to_lowercase();
     if !lower.starts_with("http://") && !lower.starts_with("https://") {
@@ -1441,6 +1505,37 @@ pub async fn analyze_podcast_dj_stream(audio_url: &str, duration_sec: f64) -> Re
         .timeout(Duration::from_secs(120))
         .build()
         .map_err(|e| format!("HTTP client build failed: {e}"))?;
+
+    if intro_only {
+        let range_hdr = format!("bytes=0-{}", INTRO_FETCH_MAX_BYTES - 1);
+        let (bytes, ct) = match fetch_audio_bytes_with_mode(
+            &client,
+            trimmed,
+            Some(&range_hdr),
+            INTRO_FETCH_MAX_BYTES,
+            true,
+        )
+        .await
+        {
+            Ok(res) => res,
+            Err(_) => {
+                fetch_audio_bytes_with_mode(
+                    &client,
+                    trimmed,
+                    None,
+                    INTRO_FETCH_MAX_BYTES,
+                    true,
+                )
+                .await?
+            }
+        };
+        let ext = infer_ext_from_url_and_ct(trimmed, ct.as_deref());
+        return tokio::task::spawn_blocking(move || {
+            analyze_audio_bytes_with_limit(&bytes, ext.as_deref(), dur, Some(INTRO_DECODE_MAX_SEC))
+        })
+        .await
+        .map_err(|e| format!("Analysis task join error: {e}"))?;
+    }
 
     if dur > FULL_STREAM_QUALITY_LIMIT_SEC {
         return analyze_podcast_dj_range_samples(&client, trimmed, dur).await;
@@ -1541,5 +1636,30 @@ mod tests {
             .unwrap();
         let err = rt.block_on(analyze_podcast_dj_stream("file:///tmp/test.mp3", 10.0));
         assert!(err.is_err());
+        let err_intro = rt.block_on(analyze_podcast_dj_stream_with_options(
+            "file:///tmp/test.mp3",
+            10.0,
+            true,
+        ));
+        assert!(err_intro.is_err());
+    }
+
+    #[test]
+    fn dj_analyzer_intro_only_limits_decoded_duration() {
+        let wav = synthesize_pulse_wav(44100, 90.0, 0.5);
+        let map = analyze_audio_bytes_with_limit(&wav, Some("wav"), 90.0, Some(55.0))
+            .expect("intro analyze ok");
+        assert_eq!(map["partial"], json!(true));
+        assert_eq!(map["introOnly"], json!(true));
+        assert_eq!(map["fullDuration"], json!(90.0));
+        assert_eq!(map["tempoSource"], json!("podcast-dj-server-intro-offline"));
+        let eff_dur = map["decode"]["effectiveDurationSec"].as_f64().unwrap();
+        assert!(
+            eff_dur >= 54.0 && eff_dur <= 56.0,
+            "expected ~55s decoded duration, got {eff_dur}"
+        );
+        let grid_step = map["gridStep"].as_f64().unwrap();
+        assert!((grid_step - 0.5).abs() < 0.06);
+        assert!(map["beats"].as_array().unwrap().len() >= 90);
     }
 }

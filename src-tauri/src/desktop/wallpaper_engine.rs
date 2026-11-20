@@ -97,6 +97,8 @@ pub struct WallpaperProjectItem {
     pub muted_audio_property_count: usize,
     pub updated_at: u64,
     pub safety_mode: String,
+    pub media_url: String,
+    pub preview_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -717,10 +719,43 @@ fn first_project_file(
     None
 }
 
+fn build_wallpaper_media_url(
+    id: &str,
+    real_root: &Path,
+    target_file: Option<&Path>,
+    media_token: &str,
+) -> String {
+    let Some(file) = target_file else {
+        return String::new();
+    };
+    if media_token.is_empty() {
+        return String::new();
+    }
+    let Ok(rel) = file.strip_prefix(real_root) else {
+        return String::new();
+    };
+    let rel_str = rel
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => s.to_str(),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    if rel_str.is_empty() {
+        return String::new();
+    }
+    let encoded_rel =
+        percent_encoding::utf8_percent_encode(&rel_str, percent_encoding::NON_ALPHANUMERIC)
+            .to_string();
+    format!("{WALLPAPER_ENGINE_SCHEME}://media/{id}?path={encoded_rel}&cap={media_token}")
+}
+
 fn index_project(
     project_root: &Path,
     source: &DiscoverySource,
     scene_package_override: Option<&Path>,
+    media_token: &str,
 ) -> Option<(WallpaperProjectItem, ProjectRecord)> {
     let (project_obj, real_manifest_file, updated_at) = read_project_manifest(project_root)?;
     let project_val = Value::Object(project_obj.clone());
@@ -873,6 +908,9 @@ fn index_project(
     }
     .to_string();
 
+    let media_url = build_wallpaper_media_url(&id, &real_root, media.as_deref(), media_token);
+    let preview_url = build_wallpaper_media_url(&id, &real_root, preview.as_deref(), media_token);
+
     let item = WallpaperProjectItem {
         id: id.clone(),
         title,
@@ -892,6 +930,8 @@ fn index_project(
         muted_audio_property_count: property_analysis.muted_audio_property_count,
         updated_at,
         safety_mode,
+        media_url,
+        preview_url,
     };
 
     let record = ProjectRecord {
@@ -1273,7 +1313,9 @@ impl WallpaperEngineLibrary {
         let mut next_index = HashMap::new();
         for (proj_root, source) in discovered_projects {
             let override_pkg = manual_package_by_root.get(&path_key(&proj_root)).map(|p| p.as_path());
-            if let Some((item, record)) = index_project(&proj_root, &source, override_pkg) {
+            if let Some((item, record)) =
+                index_project(&proj_root, &source, override_pkg, &state.media_token)
+            {
                 if !next_index.contains_key(&item.id) {
                     next_index.insert(item.id.clone(), record);
                     items.push(item);
@@ -1774,11 +1816,39 @@ mod tests {
         assert_eq!(snap.dynamic_count, 1);
         assert_eq!(snap.engine_playable_count, 1);
 
+        let video_item = snap
+            .projects
+            .iter()
+            .find(|p| p.project_type == "video")
+            .unwrap();
+        assert_eq!(
+            video_item.media_url,
+            format!(
+                "mineradio-wallpaper://media/{}?path=loop%2Emp4&cap={}",
+                video_item.id, snap.media_token
+            )
+        );
+        assert_eq!(
+            video_item.preview_url,
+            format!(
+                "mineradio-wallpaper://media/{}?path=preview%2Ejpg&cap={}",
+                video_item.id, snap.media_token
+            )
+        );
+
         let scene_item = snap
             .projects
             .iter()
             .find(|p| p.project_type == "scene")
             .unwrap();
+        assert!(scene_item.media_url.is_empty());
+        assert_eq!(
+            scene_item.preview_url,
+            format!(
+                "mineradio-wallpaper://media/{}?path=preview%2Epng&cap={}",
+                scene_item.id, snap.media_token
+            )
+        );
         let details = lib.get_project_details(&scene_item.id).unwrap();
         assert_eq!(details.audio_property_count, 4);
         assert_eq!(details.muted_audio_property_count, 4);

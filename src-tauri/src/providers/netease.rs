@@ -4078,6 +4078,7 @@ impl NeteaseClient {
         rid: &str,
         limit: usize,
         offset: usize,
+        asc: bool,
     ) -> Result<Value, String> {
         let lim = limit.clamp(10, 60);
         let (body, _) = self
@@ -4087,7 +4088,7 @@ impl NeteaseClient {
                     "radioId": rid,
                     "limit": lim,
                     "offset": offset,
-                    "asc": false,
+                    "asc": asc,
                 }),
                 None,
                 true,

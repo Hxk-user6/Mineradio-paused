@@ -164,6 +164,47 @@ fn build_range_file_protocol_response(
         .unwrap()
 }
 
+fn parse_wallpaper_scheme_request(
+    uri: &tauri::http::Uri,
+) -> Result<(String, String, String), &'static str> {
+    let segs = split_scheme_segments(uri);
+    let query = parse_query_map(uri.query());
+    let cap = query
+        .get("cap")
+        .or_else(|| query.get("token"))
+        .cloned()
+        .unwrap_or_default();
+
+    if segs.len() >= 2 && segs[0] == "media" {
+        let id = segs[1].clone();
+        let rel_path = query
+            .get("path")
+            .filter(|s| !s.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| {
+                if segs.len() >= 3 {
+                    segs[2..].join("/")
+                } else {
+                    String::new()
+                }
+            });
+        if rel_path.trim().is_empty() {
+            return Err("Invalid wallpaper asset path");
+        }
+        return Ok((id, rel_path, cap));
+    }
+
+    if segs.len() < 3 {
+        return Err("Invalid wallpaper asset path");
+    }
+    let (id, rel_slice) = if segs[0] == "project" || segs[0] == "asset" {
+        (segs[1].clone(), &segs[2..])
+    } else {
+        (segs[0].clone(), &segs[1..])
+    };
+    Ok((id, rel_slice.join("/"), cap))
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -200,28 +241,16 @@ pub fn run() {
         })
         .register_uri_scheme_protocol("mineradio-wallpaper", |ctx, req| {
             let state = ctx.app_handle().state::<Arc<TauriAppState>>();
-            let segs = split_scheme_segments(req.uri());
-            if segs.len() < 3 {
-                return build_protocol_error(400, "Invalid wallpaper asset path");
-            }
-            let (id, rel_slice) = if segs[0] == "project" || segs[0] == "asset" {
-                (segs[1].as_str(), &segs[2..])
-            } else {
-                (segs[0].as_str(), &segs[1..])
+            let (id, rel_path, cap) = match parse_wallpaper_scheme_request(req.uri()) {
+                Ok(parsed) => parsed,
+                Err(msg) => return build_protocol_error(400, msg),
             };
-            let query = parse_query_map(req.uri().query());
-            let cap = query
-                .get("cap")
-                .or_else(|| query.get("token"))
-                .map(String::as_str)
-                .unwrap_or("");
             let expected = state.backend.wallpaper_engine.list_projects(false).media_token;
             if cap != expected {
                 return build_protocol_error(403, "Forbidden");
             }
-            let rel_path = rel_slice.join("/");
             let Ok(path) = state.backend.wallpaper_engine.resolve_project_file(
-                id,
+                &id,
                 &rel_path,
                 WallpaperFileCapability::AnySafe,
             ) else {
@@ -247,9 +276,11 @@ pub fn run() {
             // 托盘菜单与图标
             let show_item = MenuItemBuilder::with_id("tray_show", "显示主窗口").build(app)?;
             let lyrics_item = MenuItemBuilder::with_id("tray_lyrics", "切换桌面歌词").build(app)?;
+            let exit_desktop_item =
+                MenuItemBuilder::with_id("tray_exit_desktop_mode", "退出壁纸模式").build(app)?;
             let quit_item = MenuItemBuilder::with_id("tray_quit", "退出 Mineradio").build(app)?;
             let tray_menu = MenuBuilder::new(app)
-                .items(&[&show_item, &lyrics_item, &quit_item])
+                .items(&[&show_item, &lyrics_item, &exit_desktop_item, &quit_item])
                 .build()?;
 
             let icon_bytes = include_bytes!("../icons/icon.png");
@@ -276,7 +307,32 @@ pub fn run() {
                                 None,
                             );
                         }
+                        "tray_exit_desktop_mode" => {
+                            let state = app.state::<Arc<TauriAppState>>();
+                            let _ = commands::set_wallpaper_mode(
+                                app.clone(),
+                                state,
+                                false,
+                                None,
+                            );
+                            if let Some(win) = app.get_webview_window("main") {
+                                let _ = win.unminimize();
+                                let _ = win.show();
+                                let _ = win.set_focus();
+                            }
+                        }
                         "tray_quit" => {
+                            #[cfg(target_os = "windows")]
+                            {
+                                if let Some(win) = app.get_webview_window("main") {
+                                    if let Ok(hwnd) = win.hwnd() {
+                                        let _ = crate::desktop::win32::set_full_desktop_attached(
+                                            hwnd.0 as isize,
+                                            false,
+                                        );
+                                    }
+                                }
+                            }
                             app.exit(0);
                         }
                         _ => {}
@@ -321,6 +377,18 @@ pub fn run() {
                         api.prevent_close();
                         if let Some(win) = app_handle.get_webview_window("main") {
                             let _ = win.hide();
+                        }
+                    } else {
+                        #[cfg(target_os = "windows")]
+                        {
+                            if let Some(win) = app_handle.get_webview_window("main") {
+                                if let Ok(hwnd) = win.hwnd() {
+                                    let _ = crate::desktop::win32::set_full_desktop_attached(
+                                        hwnd.0 as isize,
+                                        false,
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -373,6 +441,7 @@ pub fn run() {
             commands::trim_app_memory,
             commands::purge_system_memory,
             commands::configure_memory_reduct,
+            commands::desktop_lyrics_get_state,
             commands::set_desktop_lyrics_enabled,
             commands::update_desktop_lyrics,
             commands::set_desktop_lyrics_lock_state,
@@ -407,8 +476,35 @@ pub fn run() {
             commands::open_qq_music_login,
             commands::open_kugou_music_login,
             commands::open_qishui_auth_login,
+            commands::clear_platform_login_session,
             commands::close_platform_login_window,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Mineradio");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wallpaper_scheme_supports_media_query_and_legacy_project_paths() {
+        let media_uri: tauri::http::Uri =
+            "mineradio-wallpaper://media/abcdef0123456789abcdef01?path=sub%2Floop%2Emp4&cap=tok123"
+                .parse()
+                .unwrap();
+        let (id, rel, cap) = parse_wallpaper_scheme_request(&media_uri).unwrap();
+        assert_eq!(id, "abcdef0123456789abcdef01");
+        assert_eq!(rel, "sub/loop.mp4");
+        assert_eq!(cap, "tok123");
+
+        let legacy_uri: tauri::http::Uri =
+            "mineradio-wallpaper://project/abcdef0123456789abcdef01/assets/preview.png?token=tok456"
+                .parse()
+                .unwrap();
+        let (id2, rel2, cap2) = parse_wallpaper_scheme_request(&legacy_uri).unwrap();
+        assert_eq!(id2, "abcdef0123456789abcdef01");
+        assert_eq!(rel2, "assets/preview.png");
+        assert_eq!(cap2, "tok456");
+    }
 }

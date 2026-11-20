@@ -1,9 +1,13 @@
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, WebviewUrl, WebviewWindowBuilder};
+use tauri::{
+    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindowBuilder,
+};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
@@ -45,6 +49,10 @@ pub struct TauriAppState {
     pub desktop_icons_visible: AtomicBool,
     pub global_hotkey_bindings: Mutex<Vec<Value>>,
     pub pointer_route: Mutex<Value>,
+    pub memory_reduct_enabled: AtomicBool,
+    pub memory_reduct_interval_sec: AtomicU64,
+    pub memory_reduct_task_seq: AtomicU64,
+    pub platform_login_seq: AtomicU64,
 }
 
 impl TauriAppState {
@@ -70,6 +78,10 @@ impl TauriAppState {
                 "overSoftwareUi": true,
                 "overDesktopControls": false
             })),
+            memory_reduct_enabled: AtomicBool::new(false),
+            memory_reduct_interval_sec: AtomicU64::new(60),
+            memory_reduct_task_seq: AtomicU64::new(0),
+            platform_login_seq: AtomicU64::new(0),
         }
     }
 
@@ -239,6 +251,14 @@ pub fn desktop_window_close(
         .map(normalize_close_behavior)
         .unwrap_or_else(|| state.close_behavior.lock().unwrap().clone());
     if resolved == "quit" {
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(win) = app.get_webview_window("main") {
+                if let Ok(hwnd) = win.hwnd() {
+                    let _ = win32::set_full_desktop_attached(hwnd.0 as isize, false);
+                }
+            }
+        }
         app.exit(0);
         return json!({ "ok": true, "behavior": "quit" });
     }
@@ -471,6 +491,7 @@ pub fn set_cache_settings(
     let root = p
         .get("rootPath")
         .or_else(|| p.get("root_path"))
+        .or_else(|| p.get("cacheRoot"))
         .or_else(|| p.get("path"))
         .or_else(|| p.get("dir"))
         .and_then(|v| v.as_str())
@@ -572,12 +593,75 @@ pub fn purge_system_memory(payload: Option<PurgeSystemMemoryPayload>) -> Value {
 }
 
 #[tauri::command]
-pub fn configure_memory_reduct(payload: Option<Value>) -> Value {
+pub fn configure_memory_reduct(
+    state: tauri::State<'_, Arc<TauriAppState>>,
+    payload: Option<Value>,
+) -> Value {
+    let cfg = payload.unwrap_or_else(|| json!({}));
+    let enabled = cfg
+        .get("enabled")
+        .or_else(|| cfg.get("autoTrim"))
+        .or_else(|| cfg.get("auto"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let interval_sec = cfg
+        .get("intervalSec")
+        .or_else(|| cfg.get("intervalSeconds"))
+        .and_then(|v| v.as_u64())
+        .or_else(|| {
+            cfg.get("intervalMs")
+                .and_then(|v| v.as_u64())
+                .map(|ms| ms / 1000)
+        })
+        .or_else(|| {
+            cfg.get("intervalMinutes")
+                .and_then(|v| v.as_u64())
+                .map(|m| m * 60)
+        })
+        .or_else(|| {
+            cfg.get("interval").and_then(|v| v.as_u64()).map(|v| {
+                if v > 1000 {
+                    v / 1000
+                } else {
+                    v
+                }
+            })
+        })
+        .unwrap_or(60)
+        .clamp(15, 3600);
+
+    state.memory_reduct_enabled.store(enabled, Ordering::Release);
+    state
+        .memory_reduct_interval_sec
+        .store(interval_sec, Ordering::Release);
+    let seq = state.memory_reduct_task_seq.fetch_add(1, Ordering::AcqRel) + 1;
+
+    if enabled {
+        let state_bg = state.inner().clone();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                let sec = state_bg
+                    .memory_reduct_interval_sec
+                    .load(Ordering::Acquire)
+                    .clamp(15, 3600);
+                tokio::time::sleep(Duration::from_secs(sec)).await;
+                if state_bg.memory_reduct_task_seq.load(Ordering::Acquire) != seq
+                    || !state_bg.memory_reduct_enabled.load(Ordering::Acquire)
+                {
+                    break;
+                }
+                let _ = mem_trim(Some("memory-reduct-timer"));
+            }
+        });
+    }
+
     let supported = cfg!(target_os = "windows");
     json!({
-        "ok": supported,
+        "ok": true,
         "supported": supported,
-        "config": payload.unwrap_or_else(|| json!({})),
+        "enabled": enabled,
+        "intervalSec": interval_sec,
+        "config": cfg,
     })
 }
 
@@ -601,9 +685,55 @@ fn ensure_desktop_lyrics_window(app: &AppHandle) -> Result<tauri::WebviewWindow,
     .always_on_top(true)
     .skip_taskbar(true)
     .resizable(false)
+    .focused(false)
     .visible(false);
 
     builder.build().map_err(|e| format!("CREATE_LYRICS_WINDOW_FAILED:{e}"))
+}
+
+fn apply_desktop_lyrics_y_position(app: &AppHandle, win: &tauri::WebviewWindow, y_val: f64) {
+    if !y_val.is_finite() {
+        return;
+    }
+    let cur_pos = win.outer_position().unwrap_or(PhysicalPosition::new(0, 0));
+    let win_size = win.outer_size().unwrap_or(PhysicalSize::new(760, 180));
+    let monitor = win
+        .current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| app.primary_monitor().ok().flatten());
+
+    let next_y = if let Some(mon) = monitor {
+        let mon_pos = mon.position();
+        let mon_size = mon.size();
+        let max_y = mon_pos.y + (mon_size.height as i32 - win_size.height as i32).max(0);
+        let raw_y = if y_val > 0.0 && y_val <= 1.0 {
+            let ratio = y_val.clamp(0.08, 0.92);
+            mon_pos.y + ((mon_size.height as f64) * ratio - (win_size.height as f64) * 0.5).round() as i32
+        } else {
+            let scale = win.scale_factor().unwrap_or(1.0);
+            (y_val * scale).round() as i32
+        };
+        raw_y.clamp(mon_pos.y, max_y.max(mon_pos.y))
+    } else if y_val > 0.0 && y_val <= 1.0 {
+        cur_pos.y
+    } else {
+        let scale = win.scale_factor().unwrap_or(1.0);
+        (y_val * scale).round() as i32
+    };
+
+    let _ = win.set_position(PhysicalPosition::new(cur_pos.x, next_y));
+}
+
+#[tauri::command]
+pub fn desktop_lyrics_get_state(state: tauri::State<'_, Arc<TauriAppState>>) -> Value {
+    let payload = state.desktop_lyrics_payload.lock().unwrap().clone();
+    json!({
+        "ok": true,
+        "enabled": state.desktop_lyrics_enabled.load(Ordering::Acquire),
+        "locked": state.desktop_lyrics_locked.load(Ordering::Acquire),
+        "payload": payload,
+    })
 }
 
 #[tauri::command]
@@ -618,13 +748,25 @@ pub fn set_desktop_lyrics_enabled(
         .store(enabled, Ordering::Release);
     if let Some(ref p) = payload {
         *state.desktop_lyrics_payload.lock().unwrap() = Some(p.clone());
+        if let Some(click_through) = p.get("clickThrough").and_then(|v| v.as_bool()) {
+            state
+                .desktop_lyrics_locked
+                .store(click_through, Ordering::Release);
+        }
     }
 
     if enabled {
         match ensure_desktop_lyrics_window(&app) {
             Ok(win) => {
-                let locked = state.desktop_lyrics_locked.load(Ordering::Relaxed);
+                let locked = state.desktop_lyrics_locked.load(Ordering::Acquire);
                 let _ = win.set_ignore_cursor_events(locked);
+                if let Some(y_val) = payload
+                    .as_ref()
+                    .and_then(|p| p.get("y"))
+                    .and_then(|v| v.as_f64())
+                {
+                    apply_desktop_lyrics_y_position(&app, &win, y_val);
+                }
                 let _ = win.show();
                 let current_payload = state.desktop_lyrics_payload.lock().unwrap().clone();
                 if let Some(p) = current_payload {
@@ -652,8 +794,44 @@ pub fn update_desktop_lyrics(
     state: tauri::State<'_, Arc<TauriAppState>>,
     payload: Value,
 ) -> Value {
-    *state.desktop_lyrics_payload.lock().unwrap() = Some(payload.clone());
-    let _ = app.emit("mineradio-desktop-lyrics-state", payload);
+    let merged_payload = {
+        let mut guard = state.desktop_lyrics_payload.lock().unwrap();
+        let next = match (guard.take(), payload.clone()) {
+            (Some(Value::Object(mut prev)), Value::Object(patch)) => {
+                for (k, v) in patch {
+                    prev.insert(k, v);
+                }
+                Value::Object(prev)
+            }
+            (_, next) => next,
+        };
+        *guard = Some(next.clone());
+        next
+    };
+
+    if let Some(click_through) = payload.get("clickThrough").and_then(|v| v.as_bool()) {
+        let prev_locked = state.desktop_lyrics_locked.load(Ordering::Acquire);
+        if click_through != prev_locked {
+            state
+                .desktop_lyrics_locked
+                .store(click_through, Ordering::Release);
+            if let Some(win) = app.get_webview_window(DESKTOP_LYRICS_LABEL) {
+                let _ = win.set_ignore_cursor_events(click_through);
+            }
+            let _ = app.emit(
+                "mineradio-desktop-lyrics-lock-state",
+                json!({ "locked": click_through }),
+            );
+        }
+    }
+
+    if let Some(y_val) = payload.get("y").and_then(|v| v.as_f64()).filter(|y| y.is_finite()) {
+        if let Some(win) = app.get_webview_window(DESKTOP_LYRICS_LABEL) {
+            apply_desktop_lyrics_y_position(&app, &win, y_val);
+        }
+    }
+
+    let _ = app.emit("mineradio-desktop-lyrics-state", merged_payload);
     json!({ "ok": true })
 }
 
@@ -961,6 +1139,21 @@ pub fn stop_wallpaper_engine_scene(
     json!({ "ok": true, "supported": cfg!(target_os = "windows"), "active": false })
 }
 
+fn emit_wallpaper_runtime_state(app: &AppHandle, state: &TauriAppState) -> Value {
+    let status = state.backend.wallpaper_engine.get_wallpaper_mode_status();
+    let payload = json!({
+        "ok": status.ok,
+        "enabled": status.enabled,
+        "supported": status.supported,
+        "softwareLocked": state.desktop_software_locked.load(Ordering::Acquire),
+        "iconsVisible": state.desktop_icons_visible.load(Ordering::Acquire),
+        "workerwWindowId": status.workerw_window_id,
+        "message": status.message,
+    });
+    let _ = app.emit("mineradio-wallpaper-runtime-state", payload.clone());
+    payload
+}
+
 #[tauri::command]
 pub fn set_wallpaper_mode(
     app: AppHandle,
@@ -986,15 +1179,8 @@ pub fn set_wallpaper_mode(
     }
 
     match state.backend.wallpaper_engine.set_wallpaper_mode(enabled) {
-        Ok(status) => {
-            let payload = json!({
-                "ok": status.ok,
-                "enabled": status.enabled,
-                "supported": status.supported,
-                "workerwWindowId": status.workerw_window_id,
-                "message": status.message,
-            });
-            let _ = app.emit("mineradio-wallpaper-runtime-state", payload.clone());
+        Ok(_status) => {
+            let payload = emit_wallpaper_runtime_state(&app, &state);
             emit_window_state(&app, &state);
             payload
         }
@@ -1018,6 +1204,8 @@ pub fn update_wallpaper_mode(
         "ok": status.ok,
         "enabled": status.enabled,
         "supported": status.supported,
+        "softwareLocked": state.desktop_software_locked.load(Ordering::Acquire),
+        "iconsVisible": state.desktop_icons_visible.load(Ordering::Acquire),
         "options": payload.unwrap_or_else(|| json!({})),
     });
     let _ = app.emit("mineradio-wallpaper-runtime-state", res.clone());
@@ -1038,26 +1226,32 @@ pub fn set_desktop_software_locked(
     state
         .desktop_software_locked
         .store(locked, Ordering::Release);
+    emit_wallpaper_runtime_state(&app, &state);
     emit_window_state(&app, &state);
     json!({ "ok": true, "locked": locked })
 }
 
 #[tauri::command]
 pub fn set_desktop_icons_visible(
+    app: AppHandle,
     state: tauri::State<'_, Arc<TauriAppState>>,
     visible: bool,
 ) -> Value {
     match win32::set_desktop_icons_visible(visible) {
         Ok(actual) => {
             state.desktop_icons_visible.store(actual, Ordering::Release);
+            emit_wallpaper_runtime_state(&app, &state);
             json!({ "ok": true, "visible": actual, "supported": cfg!(target_os = "windows") })
         }
-        Err(err) => json!({
-            "ok": false,
-            "visible": state.desktop_icons_visible.load(Ordering::Relaxed),
-            "supported": cfg!(target_os = "windows"),
-            "error": err,
-        }),
+        Err(err) => {
+            emit_wallpaper_runtime_state(&app, &state);
+            json!({
+                "ok": false,
+                "visible": state.desktop_icons_visible.load(Ordering::Relaxed),
+                "supported": cfg!(target_os = "windows"),
+                "error": err,
+            })
+        }
     }
 }
 
@@ -1097,6 +1291,7 @@ pub fn configure_global_hotkeys(
 
     let mut registered = 0usize;
     let mut errors: Vec<String> = Vec::new();
+    let mut results_vec: Vec<Value> = Vec::new();
     for item in bindings {
         let enabled = item
             .get("enabled")
@@ -1136,14 +1331,32 @@ pub fn configure_global_hotkeys(
                 );
             }
         }) {
-            errors.push(format!("{accel}: {err}"));
+            let err_msg = err.to_string();
+            errors.push(format!("{accel}: {err_msg}"));
+            results_vec.push(json!({
+                "action": action,
+                "accelerator": accel,
+                "ok": false,
+                "error": err_msg,
+                "conflict": {
+                    "sourceName": "系统 / 其他软件",
+                    "sourceIcon": "warning",
+                    "reason": "该组合键已被占用或被系统保留",
+                },
+            }));
         } else {
             registered += 1;
+            results_vec.push(json!({
+                "action": action,
+                "accelerator": accel,
+                "ok": true,
+            }));
         }
     }
 
     json!({
         "ok": errors.is_empty(),
+        "results": results_vec,
         "registered": registered,
         "errors": errors,
     })
@@ -1175,11 +1388,211 @@ pub fn restart_app(app: AppHandle) -> Value {
 
 // ==================== 平台 Webview 登录弹窗（受彩蛋门控保护） ====================
 
-fn open_platform_login_window_impl(
+#[derive(Clone, Copy)]
+struct PlatformLoginSpec {
+    provider: &'static str,
+    title: &'static str,
+    login_url: &'static str,
+    cookie_urls: &'static [&'static str],
+}
+
+const NETEASE_LOGIN_SPEC: PlatformLoginSpec = PlatformLoginSpec {
+    provider: "netease",
+    title: "网易云音乐登录",
+    login_url: "https://music.163.com/#/login",
+    cookie_urls: &[
+        "https://music.163.com/",
+        "https://interface.music.163.com/",
+        "https://interface3.music.163.com/",
+    ],
+};
+
+const QQ_LOGIN_SPEC: PlatformLoginSpec = PlatformLoginSpec {
+    provider: "qq",
+    title: "QQ音乐登录",
+    login_url: "https://y.qq.com/",
+    cookie_urls: &[
+        "https://y.qq.com/",
+        "https://u.y.qq.com/",
+        "https://c.y.qq.com/",
+        "https://graph.qq.com/",
+    ],
+};
+
+const KUGOU_LOGIN_SPEC: PlatformLoginSpec = PlatformLoginSpec {
+    provider: "kugou",
+    title: "酷狗音乐登录",
+    login_url: "https://www.kugou.com/",
+    cookie_urls: &[
+        "https://www.kugou.com/",
+        "https://m.kugou.com/",
+        "https://gateway.kugou.com/",
+        "https://login.user.kugou.com/",
+    ],
+};
+
+const QISHUI_LOGIN_SPEC: PlatformLoginSpec = PlatformLoginSpec {
+    provider: "qishui",
+    title: "汽水音乐登录",
+    login_url: "https://music.douyin.com/",
+    cookie_urls: &[
+        "https://music.douyin.com/",
+        "https://www.douyin.com/",
+        "https://api.qishui.com/",
+    ],
+};
+
+fn platform_spec_by_name(provider: &str) -> Option<PlatformLoginSpec> {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "netease" => Some(NETEASE_LOGIN_SPEC),
+        "qq" => Some(QQ_LOGIN_SPEC),
+        "kugou" => Some(KUGOU_LOGIN_SPEC),
+        "qishui" => Some(QISHUI_LOGIN_SPEC),
+        _ => None,
+    }
+}
+
+fn clear_backend_provider_session(backend: &AppBackendState, provider: &str) {
+    match provider {
+        "netease" => {
+            let _ = backend.netease.set_cookie("");
+        }
+        "qq" => {
+            let _ = backend.qq.set_cookie("");
+        }
+        "kugou" => {
+            let _ = backend.kugou.set_cookie("");
+        }
+        "qishui" => {
+            let _ = backend.qishui.logout();
+        }
+        _ => {}
+    }
+}
+
+fn clear_webview_cookies_for_urls(win: &tauri::WebviewWindow, urls: &[&str]) {
+    for raw in urls {
+        if let Ok(parsed) = url::Url::parse(raw) {
+            if let Ok(cookies) = win.cookies_for_url(parsed) {
+                for c in cookies {
+                    let _ = win.delete_cookie(c);
+                }
+            }
+        }
+    }
+}
+
+fn collect_webview_cookies_map(
+    win: &tauri::WebviewWindow,
+    urls: &[&str],
+) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for raw in urls {
+        if let Ok(parsed) = url::Url::parse(raw) {
+            if let Ok(cookies) = win.cookies_for_url(parsed) {
+                for c in cookies {
+                    let name = c.name().trim().to_string();
+                    let val = c.value().trim().to_string();
+                    if !name.is_empty() && !val.is_empty() {
+                        map.entry(name).or_insert(val);
+                    }
+                }
+            }
+        }
+    }
+    map
+}
+
+fn serialize_cookie_map(map: &BTreeMap<String, String>) -> String {
+    map.iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn cookies_satisfy_provider(provider: &str, map: &BTreeMap<String, String>) -> bool {
+    let has_non_empty = |key: &str| map.get(key).is_some_and(|v| !v.trim().is_empty());
+    match provider {
+        "netease" => has_non_empty("MUSIC_U"),
+        "qq" => has_non_empty("qqmusic_key") || has_non_empty("qm_keyst"),
+        "kugou" => {
+            has_non_empty("token")
+                || has_non_empty("Token")
+                || has_non_empty("KugooID")
+                || has_non_empty("kugouID")
+        }
+        "qishui" => has_non_empty("sessionid") || has_non_empty("sessionid_ss"),
+        _ => false,
+    }
+}
+
+async fn apply_captured_platform_cookie(
+    backend: &AppBackendState,
+    provider: &str,
+    cookie_header: &str,
+) -> Option<Value> {
+    match provider {
+        "netease" => {
+            if backend.netease.set_cookie(cookie_header).is_ok() {
+                Some(
+                    backend
+                        .netease
+                        .login_status()
+                        .await
+                        .unwrap_or_else(|_| json!({ "loggedIn": true })),
+                )
+            } else {
+                None
+            }
+        }
+        "qq" => {
+            if backend.qq.set_cookie(cookie_header).is_ok() {
+                Some(
+                    backend
+                        .qq
+                        .login_status(true, true)
+                        .await
+                        .unwrap_or_else(|_| json!({ "provider": "qq", "loggedIn": true })),
+                )
+            } else {
+                None
+            }
+        }
+        "kugou" => {
+            if backend.kugou.set_cookie(cookie_header).is_ok() {
+                Some(
+                    backend
+                        .kugou
+                        .login_status()
+                        .await
+                        .unwrap_or_else(|_| json!({ "provider": "kugou", "loggedIn": true })),
+                )
+            } else {
+                None
+            }
+        }
+        "qishui" => {
+            if backend.qishui.set_cookie(cookie_header).is_ok() {
+                Some(
+                    backend
+                        .qishui
+                        .status()
+                        .await
+                        .unwrap_or_else(|_| json!({ "provider": "qishui", "loggedIn": true })),
+                )
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+async fn open_platform_login_window_impl(
     app: &AppHandle,
-    state: &TauriAppState,
-    title: &str,
-    url: &str,
+    state: &Arc<TauriAppState>,
+    spec: PlatformLoginSpec,
+    force_reauth: bool,
 ) -> Value {
     if !state.backend.gate.is_unlocked() {
         return json!({
@@ -1191,55 +1604,181 @@ fn open_platform_login_window_impl(
     if let Some(existing) = app.get_webview_window(PLATFORM_LOGIN_LABEL) {
         let _ = existing.close();
     }
-    let Ok(parsed) = url::Url::parse(url) else {
+    let Ok(parsed) = url::Url::parse(spec.login_url) else {
         return json!({ "ok": false, "error": "INVALID_LOGIN_URL" });
     };
-    match WebviewWindowBuilder::new(app, PLATFORM_LOGIN_LABEL, WebviewUrl::External(parsed))
-        .title(title)
-        .inner_size(980.0, 680.0)
-        .center()
-        .build()
-    {
-        Ok(_) => json!({ "ok": true, "url": url }),
-        Err(err) => json!({ "ok": false, "error": format!("LOGIN_WINDOW_FAILED:{err}") }),
+
+    if force_reauth {
+        clear_backend_provider_session(&state.backend, spec.provider);
     }
-}
 
-#[tauri::command]
-pub fn open_netease_music_login(
-    app: AppHandle,
-    state: tauri::State<'_, Arc<TauriAppState>>,
-) -> Value {
-    open_platform_login_window_impl(
-        &app,
-        &state,
-        "网易云音乐登录",
-        "https://music.163.com/#/login",
+    let initial_url = if force_reauth {
+        url::Url::parse("about:blank").unwrap_or_else(|_| parsed.clone())
+    } else {
+        parsed.clone()
+    };
+
+    let win = match WebviewWindowBuilder::new(
+        app,
+        PLATFORM_LOGIN_LABEL,
+        WebviewUrl::External(initial_url),
     )
+    .title(spec.title)
+    .inner_size(980.0, 680.0)
+    .center()
+    .build()
+    {
+        Ok(w) => w,
+        Err(err) => {
+            return json!({ "ok": false, "error": format!("LOGIN_WINDOW_FAILED:{err}") })
+        }
+    };
+
+    if force_reauth {
+        clear_webview_cookies_for_urls(&win, spec.cookie_urls);
+        let _ = win.navigate(parsed);
+    }
+
+    let seq = state.platform_login_seq.fetch_add(1, Ordering::AcqRel) + 1;
+    let app_bg = app.clone();
+    let state_bg = state.clone();
+    tauri::async_runtime::spawn(async move {
+        // 最长轮询 15 分钟
+        for _ in 0..1125 {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            if state_bg.platform_login_seq.load(Ordering::Acquire) != seq {
+                break;
+            }
+            let Some(login_win) = app_bg.get_webview_window(PLATFORM_LOGIN_LABEL) else {
+                break;
+            };
+            let cookie_map = collect_webview_cookies_map(&login_win, spec.cookie_urls);
+            if !cookies_satisfy_provider(spec.provider, &cookie_map) {
+                continue;
+            }
+            let cookie_header = serialize_cookie_map(&cookie_map);
+            if cookie_header.is_empty() {
+                continue;
+            }
+            if let Some(status_val) =
+                apply_captured_platform_cookie(&state_bg.backend, spec.provider, &cookie_header)
+                    .await
+            {
+                let _ = app_bg.emit(
+                    "mineradio-platform-login-success",
+                    json!({
+                        "provider": spec.provider,
+                        "loggedIn": true,
+                        "status": status_val,
+                    }),
+                );
+                let _ = login_win.close();
+                break;
+            }
+        }
+    });
+
+    json!({ "ok": true, "url": spec.login_url, "provider": spec.provider })
 }
 
 #[tauri::command]
-pub fn open_qq_music_login(
+pub async fn open_netease_music_login(
     app: AppHandle,
     state: tauri::State<'_, Arc<TauriAppState>>,
-) -> Value {
-    open_platform_login_window_impl(&app, &state, "QQ音乐登录", "https://y.qq.com/")
+    force_reauth: Option<bool>,
+) -> Result<Value, String> {
+    Ok(open_platform_login_window_impl(
+        &app,
+        state.inner(),
+        NETEASE_LOGIN_SPEC,
+        force_reauth.unwrap_or(false),
+    )
+    .await)
 }
 
 #[tauri::command]
-pub fn open_kugou_music_login(
+pub async fn open_qq_music_login(
     app: AppHandle,
     state: tauri::State<'_, Arc<TauriAppState>>,
-) -> Value {
-    open_platform_login_window_impl(&app, &state, "酷狗音乐登录", "https://www.kugou.com/")
+    force_reauth: Option<bool>,
+) -> Result<Value, String> {
+    Ok(open_platform_login_window_impl(
+        &app,
+        state.inner(),
+        QQ_LOGIN_SPEC,
+        force_reauth.unwrap_or(false),
+    )
+    .await)
 }
 
 #[tauri::command]
-pub fn open_qishui_auth_login(
+pub async fn open_kugou_music_login(
     app: AppHandle,
     state: tauri::State<'_, Arc<TauriAppState>>,
-) -> Value {
-    open_platform_login_window_impl(&app, &state, "汽水音乐登录", "https://music.douyin.com/")
+    force_reauth: Option<bool>,
+) -> Result<Value, String> {
+    Ok(open_platform_login_window_impl(
+        &app,
+        state.inner(),
+        KUGOU_LOGIN_SPEC,
+        force_reauth.unwrap_or(false),
+    )
+    .await)
+}
+
+#[tauri::command]
+pub async fn open_qishui_auth_login(
+    app: AppHandle,
+    state: tauri::State<'_, Arc<TauriAppState>>,
+    force_reauth: Option<bool>,
+) -> Result<Value, String> {
+    Ok(open_platform_login_window_impl(
+        &app,
+        state.inner(),
+        QISHUI_LOGIN_SPEC,
+        force_reauth.unwrap_or(false),
+    )
+    .await)
+}
+
+#[tauri::command]
+pub async fn clear_platform_login_session(
+    app: AppHandle,
+    state: tauri::State<'_, Arc<TauriAppState>>,
+    provider: String,
+) -> Result<Value, String> {
+    let normalized = provider.trim().to_ascii_lowercase();
+    let specs: Vec<PlatformLoginSpec> = if normalized == "all" {
+        vec![
+            NETEASE_LOGIN_SPEC,
+            QQ_LOGIN_SPEC,
+            KUGOU_LOGIN_SPEC,
+            QISHUI_LOGIN_SPEC,
+        ]
+    } else if let Some(spec) = platform_spec_by_name(&normalized) {
+        vec![spec]
+    } else {
+        return Ok(json!({
+            "ok": false,
+            "error": "UNSUPPORTED_PROVIDER",
+            "provider": provider,
+        }));
+    };
+
+    for spec in &specs {
+        clear_backend_provider_session(&state.backend, spec.provider);
+        for label in [PLATFORM_LOGIN_LABEL, "main"] {
+            if let Some(win) = app.get_webview_window(label) {
+                clear_webview_cookies_for_urls(&win, spec.cookie_urls);
+            }
+        }
+    }
+
+    Ok(json!({
+        "ok": true,
+        "provider": normalized,
+        "cleared": specs.iter().map(|s| s.provider).collect::<Vec<_>>(),
+    }))
 }
 
 #[tauri::command]
@@ -1248,4 +1787,39 @@ pub fn close_platform_login_window(app: AppHandle) -> Value {
         let _ = win.close();
     }
     json!({ "ok": true })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn platform_cookie_detection_and_serialization_work() {
+        let mut ne = BTreeMap::new();
+        assert!(!cookies_satisfy_provider("netease", &ne));
+        ne.insert("MUSIC_U".to_string(), "tok1".to_string());
+        ne.insert("__csrf".to_string(), "c1".to_string());
+        assert!(cookies_satisfy_provider("netease", &ne));
+        assert_eq!(serialize_cookie_map(&ne), "MUSIC_U=tok1; __csrf=c1");
+
+        let mut qq = BTreeMap::new();
+        qq.insert("uin".to_string(), "12345".to_string());
+        assert!(!cookies_satisfy_provider("qq", &qq));
+        qq.insert("qm_keyst".to_string(), "qk1".to_string());
+        assert!(cookies_satisfy_provider("qq", &qq));
+
+        let mut kg = BTreeMap::new();
+        kg.insert("kg_mid".to_string(), "m1".to_string());
+        assert!(!cookies_satisfy_provider("kugou", &kg));
+        kg.insert("KugooID".to_string(), "9988".to_string());
+        assert!(cookies_satisfy_provider("kugou", &kg));
+
+        let mut qs = BTreeMap::new();
+        assert!(!cookies_satisfy_provider("qishui", &qs));
+        qs.insert("sessionid".to_string(), "sid_abc".to_string());
+        assert!(cookies_satisfy_provider("qishui", &qs));
+
+        assert!(platform_spec_by_name("NetEase").is_some());
+        assert!(platform_spec_by_name("unknown").is_none());
+    }
 }
