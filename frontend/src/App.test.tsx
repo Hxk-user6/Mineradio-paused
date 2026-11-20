@@ -3,7 +3,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from './App';
 import { DesktopLyricsApp } from './DesktopLyricsApp';
 import { AccountAndLoginModal } from './components/AccountAndLoginModal';
+import { FxConsoleModal } from './components/FxConsoleModal';
 import { SearchBar } from './components/SearchBar';
+import { TrackDetailModal } from './components/TrackDetailModal';
 import { desktopWindow, emitLocalEvent } from './bridge/tauriBridge';
 import { usePlayerStore } from './store/playerStore';
 import { DEFAULT_FX_SETTINGS } from './types/mineradio';
@@ -67,6 +69,9 @@ describe('Mineradio UI & Desktop Lyrics', () => {
       playlistPanelOpen: false,
       splashDone: true,
       updateInfo: null,
+      trackDetailOpen: false,
+      trackDetailSong: null,
+      customLyricModalOpen: false,
     });
   });
 
@@ -97,19 +102,21 @@ describe('Mineradio UI & Desktop Lyrics', () => {
   });
 
   it('SearchBar 支持搜索模式切换与搜索结果渲染', async () => {
-    const searchSpy = vi.fn(async (query: string, mode?: 'song' | 'netease' | 'qq' | 'kugou' | 'qishui' | 'podcast') => {
-      const mockResults = [
-        {
-          id: '101',
-          name: `${query}-测试曲目`,
-          artist: '测试歌手',
-          album: '测试专辑',
-          provider: (mode === 'qq' ? 'qq' : 'netease') as 'qq' | 'netease',
-        },
-      ];
-      usePlayerStore.setState({ searchResults: mockResults, searchLoading: false });
-      return mockResults;
-    });
+    const searchSpy = vi.fn(
+      async (query: string, mode?: 'song' | 'netease' | 'qq' | 'kugou' | 'qishui' | 'podcast') => {
+        const mockResults = [
+          {
+            id: '101',
+            name: `${query}-测试曲目`,
+            artist: '测试歌手',
+            album: '测试专辑',
+            provider: (mode === 'qq' ? 'qq' : 'netease') as 'qq' | 'netease',
+          },
+        ];
+        usePlayerStore.setState({ searchResults: mockResults, searchLoading: false });
+        return mockResults;
+      }
+    );
     usePlayerStore.setState({ searchTracks: searchSpy });
 
     render(<SearchBar />);
@@ -132,7 +139,7 @@ describe('Mineradio UI & Desktop Lyrics', () => {
     });
   });
 
-  it('AccountAndLoginModal 支持“世界和平”彩蛋解锁并进入多平台登录', async () => {
+  it('AccountAndLoginModal 轻触 5 次大小眼才显示暗号输入框且无答案剧透，支持“世界和平”彩蛋解锁并进入多平台登录', async () => {
     const unlockSpy = vi.fn(async (password: string) => {
       const ok = password.trim() === '世界和平';
       if (ok) {
@@ -151,12 +158,27 @@ describe('Mineradio UI & Desktop Lyrics', () => {
       unlockEasterEgg: unlockSpy,
     });
 
-    render(<AccountAndLoginModal />);
+    const { container } = render(<AccountAndLoginModal />);
 
     const userBtn = screen.getByRole('button', { name: '账号与登录' });
     fireEvent.click(userBtn);
 
+    // 初始未轻触 5 次大小眼时，不应显示暗号输入框，且无“世界和平”答案剧透
+    expect(screen.queryByLabelText('输入四个字的愿望')).toBeNull();
+    expect(container.querySelector('#login-easter-egg-gate')?.textContent).not.toContain('世界和平');
+
+    const eyeTrigger = screen.getByRole('button', { name: '轻触大小眼' });
+    for (let i = 0; i < 4; i++) {
+      fireEvent.click(eyeTrigger);
+      expect(screen.queryByLabelText('输入四个字的愿望')).toBeNull();
+    }
+
+    // 第 5 次轻触后显示暗号输入框，且仍无答案剧透
+    fireEvent.click(eyeTrigger);
     const wishInput = screen.getByLabelText('输入四个字的愿望');
+    expect(wishInput).toBeTruthy();
+    expect(container.querySelector('#login-easter-egg-gate')?.textContent).not.toContain('世界和平');
+
     fireEvent.change(wishInput, { target: { value: '世界和平' } });
     fireEvent.click(screen.getByRole('button', { name: '解锁登录' }));
 
@@ -170,7 +192,139 @@ describe('Mineradio UI & Desktop Lyrics', () => {
     expect(screen.getByText('汽水音乐')).toBeTruthy();
   });
 
-  it('DesktopLyricsApp 监听 mineradio-desktop-lyrics-state 更新歌词并支持锁定切换', async () => {
+  it('FxConsoleModal 支持 Preset 7/8 专属参数面板及系统缓存与内存字段展示', async () => {
+    vi.spyOn(desktopWindow, 'getCacheSettings').mockResolvedValue({
+      ok: true,
+      cDriveProtected: true,
+      settings: {
+        rootPath: 'D:\\MineradioCache',
+        lyricsPath: 'D:\\MineradioCache\\lyrics',
+        beatmapsPath: 'D:\\MineradioCache\\beatmaps',
+        wallpaperEnginePath: 'D:\\MineradioCache\\we',
+        userDataPath: 'D:\\MineradioCache\\userdata',
+      },
+      usage: {
+        lyricsBytes: 2 * 1024 * 1024,
+        beatmapsBytes: 5 * 1024 * 1024,
+        wallpaperEngineBytes: 10 * 1024 * 1024,
+        userDataBytes: 1 * 1024 * 1024,
+        totalManagedBytes: 18 * 1024 * 1024,
+      },
+    });
+    vi.spyOn(desktopWindow, 'getMemorySnapshot').mockResolvedValue({
+      supported: true,
+      totalMB: 16384,
+      usedMB: 8192,
+      usedPercent: 50,
+      process: {
+        rssMB: 320.5,
+        privateMB: 280.2,
+      },
+    });
+
+    usePlayerStore.setState({
+      fxPanelOpen: true,
+      activePreset: 7,
+      fx: { ...DEFAULT_FX_SETTINGS, preset: 7 },
+    });
+
+    const { container } = render(<FxConsoleModal />);
+
+    // 切换到“动效”页签验证 Preset 7 专属参数
+    fireEvent.click(screen.getByRole('tab', { name: '动效' }));
+    expect(container.querySelector('#fx-preset-7-panel')).not.toBeNull();
+    expect(screen.getByText('Preset 7 · Sonic Ground')).toBeTruthy();
+    expect(screen.getByText('地形振幅')).toBeTruthy();
+
+    // 切换到 Preset 8 验证 Preset 8 专属参数
+    act(() => {
+      usePlayerStore.setState({
+        activePreset: 8,
+        fx: { ...DEFAULT_FX_SETTINGS, preset: 8 },
+      });
+    });
+    expect(container.querySelector('#fx-preset-8-panel')).not.toBeNull();
+    expect(screen.getByText('Preset 8 · Sonic Workshop')).toBeTruthy();
+    expect(screen.getByText('输入增益')).toBeTruthy();
+
+    // 切换到“系统”页签验证缓存与内存诊断字段显示
+    fireEvent.click(screen.getByRole('tab', { name: '系统' }));
+    await waitFor(() => {
+      expect(container.querySelector('#cache-storage-root')?.textContent).toBe('D:\\MineradioCache');
+    });
+    expect(container.querySelector('#cache-usage-total')?.textContent).toBe('18.0 MB');
+    expect(container.querySelector('#mem-total')?.textContent).toBe('16.00 GB');
+    expect(container.querySelector('#mem-process')?.textContent).toBe('320.5 MB');
+  });
+
+  it('TrackDetailModal 打开渲染歌曲信息并加载热门与最新评论列表', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/song/comments')) {
+        return new Response(
+          JSON.stringify({
+            hotComments: [
+              {
+                commentId: 'h1',
+                content: '这首粒子视觉绝了！',
+                likedCount: 88,
+                user: { nickname: '热评听友' },
+              },
+            ],
+            comments: [
+              {
+                commentId: 'c1',
+                content: '深夜听歌打卡',
+                likedCount: 5,
+                user: { nickname: '夜航船' },
+              },
+            ],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+
+    usePlayerStore.setState({
+      trackDetailOpen: true,
+      trackDetailSong: {
+        id: '2026',
+        name: '星空漫游',
+        artist: 'Mineradio Band',
+        album: 'Cosmic Horizons',
+        provider: 'netease',
+      },
+    });
+
+    const { container } = render(<TrackDetailModal />);
+
+    expect(container.querySelector('#track-detail-modal')).not.toBeNull();
+    expect(screen.getByText('星空漫游')).toBeTruthy();
+    expect(screen.getByText(/Mineradio Band/)).toBeTruthy();
+
+    expect(await screen.findByText('这首粒子视觉绝了！')).toBeTruthy();
+    expect(screen.getByText('热评听友')).toBeTruthy();
+    expect(screen.getByText('深夜听歌打卡')).toBeTruthy();
+    expect(screen.getByText('夜航船')).toBeTruthy();
+  });
+
+  it('DesktopLyricsApp 挂载主动调用 desktopLyricsGetState 立即渲染初始歌词，并监听状态事件与支持锁定切换', async () => {
+    const getStateSpy = vi.spyOn(desktopWindow, 'desktopLyricsGetState').mockResolvedValue({
+      ok: true,
+      enabled: true,
+      locked: false,
+      payload: {
+        line: '首帧初始桌面歌词',
+        translation: 'Initial desktop lyric frame',
+        nextLine: '下一句紧随其后',
+        playing: true,
+        progress: 0.25,
+      },
+    });
     const lockSpy = vi
       .spyOn(desktopWindow, 'setDesktopLyricsLockState')
       .mockResolvedValue({ ok: true, locked: true });
@@ -181,8 +335,12 @@ describe('Mineradio UI & Desktop Lyrics', () => {
     render(<DesktopLyricsApp />);
 
     await waitFor(() => {
-      expect(screen.getByLabelText('Mineradio desktop lyrics')).toBeTruthy();
+      expect(getStateSpy).toHaveBeenCalledTimes(1);
     });
+    expect(await screen.findByText('首帧初始桌面歌词')).toBeTruthy();
+    expect(screen.getByTestId('desktop-lyrics-translation').textContent).toBe(
+      'Initial desktop lyric frame'
+    );
 
     act(() => {
       emitLocalEvent('mineradio-desktop-lyrics-state', {
