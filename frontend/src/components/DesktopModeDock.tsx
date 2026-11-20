@@ -20,28 +20,77 @@ export function DesktopModeDock({ onToast }: DesktopModeDockProps): React.ReactE
   }, [fx.wallpaperMode]);
 
   useEffect(() => {
+    const syncFromPayload = (payload: Record<string, unknown> | null | undefined) => {
+      if (!payload || typeof payload !== 'object') return;
+
+      const rawEnabled =
+        typeof payload.enabled === 'boolean'
+          ? payload.enabled
+          : typeof payload.wallpaperMode === 'boolean'
+          ? payload.wallpaperMode
+          : typeof payload.isDesktopEmbedded === 'boolean'
+          ? payload.isDesktopEmbedded
+          : undefined;
+
+      if (typeof rawEnabled === 'boolean') {
+        setWallpaperEnabled(rawEnabled);
+        if (usePlayerStore.getState().fx.wallpaperMode !== rawEnabled) {
+          updateFx({ wallpaperMode: rawEnabled });
+        }
+      }
+
+      const rawLocked =
+        typeof payload.softwareLocked === 'boolean'
+          ? payload.softwareLocked
+          : typeof payload.desktopSoftwareLocked === 'boolean'
+          ? payload.desktopSoftwareLocked
+          : typeof payload.locked === 'boolean'
+          ? payload.locked
+          : undefined;
+
+      if (typeof rawLocked === 'boolean') {
+        setSoftwareLocked(rawLocked);
+      }
+
+      const rawIconsVisible =
+        typeof payload.iconsVisible === 'boolean'
+          ? payload.iconsVisible
+          : typeof payload.desktopIconsVisible === 'boolean'
+          ? payload.desktopIconsVisible
+          : typeof payload.visible === 'boolean'
+          ? payload.visible
+          : undefined;
+
+      if (typeof rawIconsVisible === 'boolean') {
+        setIconsVisible(rawIconsVisible);
+      }
+    };
+
     desktopWindow
       .getWallpaperModeStatus()
       .then((res) => {
-        if (typeof res?.enabled === 'boolean') {
-          setWallpaperEnabled(res.enabled);
-        }
+        syncFromPayload(res as unknown as Record<string, unknown>);
       })
       .catch(() => {});
 
-    const unlisten = desktopWindow.onWallpaperModeState((payload) => {
-      if (typeof payload?.enabled === 'boolean') {
-        setWallpaperEnabled(payload.enabled);
-        updateFx({ wallpaperMode: payload.enabled });
-      }
-      if (typeof payload?.softwareLocked === 'boolean') {
-        setSoftwareLocked(payload.softwareLocked);
-      }
-      if (typeof payload?.iconsVisible === 'boolean') {
-        setIconsVisible(payload.iconsVisible);
-      }
+    desktopWindow
+      .getState()
+      .then((state) => {
+        syncFromPayload(state as unknown as Record<string, unknown>);
+      })
+      .catch(() => {});
+
+    const unlistenWallpaper = desktopWindow.onWallpaperModeState((payload) => {
+      syncFromPayload(payload);
     });
-    return unlisten;
+    const unlistenWindowState = desktopWindow.onStateChange((state) => {
+      syncFromPayload(state as unknown as Record<string, unknown>);
+    });
+
+    return () => {
+      unlistenWallpaper();
+      unlistenWindowState();
+    };
   }, [updateFx]);
 
   useEffect(() => {
@@ -51,7 +100,8 @@ export function DesktopModeDock({ onToast }: DesktopModeDockProps): React.ReactE
     document.body.classList.toggle('desktop-mode-control-peek', wallpaperEnabled);
     document.body.classList.toggle('desktop-mode-controls-open', dockOpen);
     document.body.classList.toggle('desktop-software-locked', softwareLocked);
-  }, [wallpaperEnabled, dockOpen, softwareLocked]);
+    document.body.classList.toggle('desktop-icons-hidden', !iconsVisible);
+  }, [wallpaperEnabled, dockOpen, softwareLocked, iconsVisible]);
 
   const handleToggleWallpaperMode = async () => {
     const next = !wallpaperEnabled;
