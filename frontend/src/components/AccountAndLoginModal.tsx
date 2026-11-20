@@ -245,7 +245,11 @@ export function AccountAndLoginModal({
       if (target === 'netease') {
         setQrStatus('正在获取网易云二维码...');
         setQrStateClass('preview');
-        const keyRes = await apiJson<{ key?: string }>('/api/login/qr/key');
+        let keyRes = await apiJson<{ key?: string; error?: string }>('/api/login/qr/key');
+        if (keyRes.error === 'LOGIN_EASTER_EGG_LOCKED' && easterEggUnlocked) {
+          await desktopWindow.unlockLoginEasterEgg('世界和平').catch(() => {});
+          keyRes = await apiJson<{ key?: string; error?: string }>('/api/login/qr/key');
+        }
         if (!keyRes.key) throw new Error('获取二维码 Key 失败');
         const qrRes = await apiJson<{ img?: string }>(
           `/api/login/qr/create?key=${encodeURIComponent(keyRes.key)}`
@@ -259,9 +263,15 @@ export function AccountAndLoginModal({
       } else if (target === 'qishui') {
         setQrStatus('正在获取汽水音乐二维码...');
         setQrStateClass('preview');
-        const qrRes = await apiJson<{ token?: string; qrcode?: string }>(
+        let qrRes = await apiJson<{ token?: string; qrcode?: string; error?: string }>(
           `/api/qishui/login/qrcode?t=${Date.now()}`
         );
+        if (qrRes.error === 'LOGIN_EASTER_EGG_LOCKED' && easterEggUnlocked) {
+          await desktopWindow.unlockLoginEasterEgg('世界和平').catch(() => {});
+          qrRes = await apiJson<{ token?: string; qrcode?: string; error?: string }>(
+            `/api/qishui/login/qrcode?t=${Date.now()}`
+          );
+        }
         if (!qrRes.token || !qrRes.qrcode) throw new Error('生成汽水音乐二维码失败');
         if (pollTokenRef.current !== token) return;
         setQrImg(qrRes.qrcode);
@@ -511,7 +521,7 @@ export function AccountAndLoginModal({
           if (e.target === e.currentTarget) closeLogin();
         }}
       >
-        <div className="modal dual-login-modal">
+        <div className={`modal dual-login-modal${easterEggUnlocked ? ' login-details-open' : ''}`}>
           <div className="login-panel-head">
             <div>
               <b>{easterEggUnlocked ? '多平台账号接入' : '登录解锁'}</b>
@@ -624,15 +634,45 @@ export function AccountAndLoginModal({
           ) : (
             <>
               <div id="login-node-graph" className="login-node-graph" data-provider={provider}>
+                <svg
+                  id="login-workflow-svg"
+                  className="workflow-link-layer login-link-layer"
+                  viewBox="0 0 528 220"
+                  preserveAspectRatio="none"
+                  aria-hidden="true"
+                >
+                  {PROVIDERS.map((p, idx) => {
+                    const isSelected = provider === p.key;
+                    const isLogged = Boolean(platformLogins[p.key]?.loggedIn);
+                    if (!isSelected && !isLogged) return null;
+                    const y1 = 28 + idx * 54;
+                    const y2 = 110;
+                    const d = `M 250 ${y1} C 306 ${y1}, 304 ${y2}, 360 ${y2}`;
+                    return (
+                      <path
+                        key={p.key}
+                        d={d}
+                        className={`workflow-link ${isLogged ? 'active' : 'pending'}${
+                          isSelected ? ' selected' : ''
+                        }`}
+                      />
+                    );
+                  })}
+                </svg>
+
                 <div className="login-platform-tabs login-node-providers" id="login-platform-tabs">
                   {PROVIDERS.map((p) => {
                     const active = provider === p.key;
-                    const loggedIn = Boolean(platformLogins[p.key]?.loggedIn);
+                    const entry = platformLogins[p.key];
+                    const loggedIn = Boolean(entry?.loggedIn);
+                    const avatar = entry?.avatar || entry?.avatarUrl;
                     return (
                       <button
                         key={p.key}
                         id={`login-provider-${p.key}`}
-                        className={`${p.key}${active ? ' active' : ''} workflow-node`}
+                        className={`${p.key}${active ? ' active' : ''}${
+                          loggedIn ? ' connected external-on' : ''
+                        } workflow-node`}
                         type="button"
                         data-login-provider={p.key}
                         onClick={() => {
@@ -642,22 +682,100 @@ export function AccountAndLoginModal({
                           setCookieOpen(p.key === 'qq' || p.key === 'kugou');
                           setQrStatus(
                             loggedIn
-                              ? `已登录 · ${platformLogins[p.key]?.nickname || p.name}`
-                              : `点击“开始登录”连接 ${p.name}`
+                              ? `已登录 · ${entry?.nickname || p.name}`
+                              : `选择下方登录方式连接 ${p.name}`
                           );
                           setQrStateClass(loggedIn ? 'scan' : '');
+                          if (!loggedIn && (p.key === 'netease' || p.key === 'qishui')) {
+                            setTimeout(() => {
+                              startProviderLogin(p.key).catch(() => {});
+                            }, 30);
+                          }
                         }}
                       >
-                        <span className="provider-logo">{p.code}</span>
+                        <span className="login-provider-sort-handle" aria-hidden="true">
+                          <i />
+                          <i />
+                          <i />
+                        </span>
+                        <span className={`provider-logo${loggedIn && avatar ? ' has-avatar' : ''}`}>
+                          {loggedIn && avatar ? <img src={avatar} alt="" /> : p.code}
+                        </span>
                         <b>{p.name}</b>
-                        <small>{loggedIn ? '已登录' : p.desc}</small>
+                        <span
+                          className={`login-provider-state-badge ${
+                            loggedIn ? 'normal' : 'hidden'
+                          }`}
+                        >
+                          {loggedIn ? '已登录' : ''}
+                        </span>
+                        <span
+                          className="login-provider-external-switch"
+                          aria-hidden="true"
+                        >
+                          <span className="login-provider-external-label">
+                            {loggedIn ? '在线' : '待连'}
+                          </span>
+                          <i />
+                        </span>
+                        <span
+                          className="flow-port out"
+                          data-login-provider-output={p.key}
+                          title="已连接至 MR 接入口"
+                        />
                       </button>
                     );
                   })}
                 </div>
+
+                <div className="login-node-hub workflow-node" data-login-node="mr">
+                  <span className="flow-port in" data-login-mr-target="mr" title="MR 接入口" />
+                  <span className="login-node-orb">MR</span>
+                  <div className="login-node-copy">
+                    <b>MR</b>
+                    <small>
+                      {activeEntry?.loggedIn
+                        ? `已接入 · ${activeEntry.nickname || provider.toUpperCase()}`
+                        : `${PROVIDERS.find((p) => p.key === provider)?.name} 接入口`}
+                    </small>
+                  </div>
+                  <div className="login-mode-nodes">
+                    <button
+                      id="login-mode-official"
+                      className={`login-mode-node workflow-node${!cookieOpen ? ' active' : ''}`}
+                      type="button"
+                      data-login-mode="official"
+                      onClick={() => {
+                        setCookieOpen(false);
+                        if (
+                          !qrImg &&
+                          !authBusy &&
+                          (provider === 'netease' || provider === 'qishui')
+                        ) {
+                          startProviderLogin(provider).catch(() => {});
+                        }
+                      }}
+                    >
+                      <span className="provider-logo">QR</span>
+                      <b>{provider === 'kugou' ? '官网' : '扫码'}</b>
+                      <small>官方窗口</small>
+                    </button>
+                    <button
+                      id="login-mode-cookie"
+                      className={`login-mode-node workflow-node${cookieOpen ? ' active' : ''}`}
+                      type="button"
+                      data-login-mode="cookie"
+                      onClick={() => setCookieOpen(true)}
+                    >
+                      <span className="provider-logo">CK</span>
+                      <b>Cookie</b>
+                      <small>保存会话</small>
+                    </button>
+                  </div>
+                </div>
               </div>
 
-              <div id="login-auth-drawer" className="login-auth-drawer">
+              <div id="login-auth-drawer" className="login-auth-drawer show">
                 <div className="login-auth-copy">
                   <h2 id="login-modal-title">
                     {PROVIDERS.find((p) => p.key === provider)?.name} 账号连接
@@ -665,61 +783,81 @@ export function AccountAndLoginModal({
                   <div id="login-modal-desc" className="desc">
                     {activeEntry?.loggedIn
                       ? `当前账号：${activeEntry.nickname || activeEntry.userId || '已登录'}`
-                      : '支持官方二维码扫码或手动导入 Cookie 会话。'}
+                      : '支持官方二维码扫码、官方登录窗口或手动导入 Cookie 会话。'}
                   </div>
                   <div id="qr-status" className={qrStateClass || undefined}>
                     {qrStatus}
                   </div>
+
+                  <div
+                    id="qq-cookie-panel"
+                    className={`qq-cookie-panel${
+                      cookieOpen || provider === 'qq' || provider === 'kugou' ? ' show' : ''
+                    }`}
+                  >
+                    <textarea
+                      id="qq-cookie-input"
+                      className="qq-cookie-input"
+                      spellCheck={false}
+                      autoComplete="off"
+                      placeholder={
+                        provider === 'qq'
+                          ? 'uin=...; qqmusic_key=...; qm_keyst=...'
+                          : provider === 'kugou'
+                          ? '粘贴酷狗音乐 Cookie'
+                          : provider === 'qishui'
+                          ? '粘贴汽水音乐 Cookie 兜底'
+                          : 'MUSIC_U=...'
+                      }
+                      value={cookieText}
+                      onChange={(e) => setCookieText(e.target.value)}
+                    />
+                    <div className="qq-cookie-actions">
+                      <div className="qq-cookie-note">导入后将保存到本地安全会话。</div>
+                      <button
+                        id="qq-cookie-save-btn"
+                        className="modal-btn primary"
+                        type="button"
+                        disabled={authBusy}
+                        onClick={() => {
+                          handleSubmitCookie().catch(() => {});
+                        }}
+                      >
+                        保存 Cookie
+                      </button>
+                    </div>
+                  </div>
                 </div>
 
                 <div className="login-auth-body">
-                  {qrImg && (
-                    <div id="qr-shell" className="qr-shell">
-                      <img id="qr-img" src={qrImg} alt={`${provider} 登录二维码`} />
-                    </div>
-                  )}
-
-                  {(cookieOpen || provider === 'qq' || provider === 'kugou') && (
-                    <div
-                      id="qq-cookie-panel"
-                      className="qq-cookie-panel"
-                      style={{ display: 'block' }}
-                    >
-                      <textarea
-                        id="qq-cookie-input"
-                        className="qq-cookie-input"
-                        spellCheck={false}
-                        autoComplete="off"
-                        placeholder={
-                          provider === 'qq'
-                            ? 'uin=...; qqmusic_key=...; qm_keyst=...'
-                            : provider === 'kugou'
-                            ? '粘贴酷狗音乐 Cookie'
-                            : provider === 'qishui'
-                            ? '粘贴汽水音乐 Cookie 兜底'
-                            : 'MUSIC_U=...'
+                  <div
+                    id="qr-shell"
+                    className={`qr-shell${!qrImg ? ' web-login-preview' : ''}${
+                      provider === 'netease' ? ' netease-preview' : ''
+                    }`}
+                  >
+                    {qrImg && <img id="qr-img" src={qrImg} alt={`${provider} 登录二维码`} />}
+                    <button
+                      id="qq-web-login-card"
+                      className="qq-login-mark"
+                      type="button"
+                      disabled={authBusy}
+                      onClick={() => {
+                        if (provider === 'netease' || provider === 'qishui') {
+                          startProviderLogin(provider).catch(() => {});
+                        } else {
+                          handleOfficialLogin(provider).catch(() => {});
                         }
-                        value={cookieText}
-                        onChange={(e) => setCookieText(e.target.value)}
-                      />
-                      <div className="qq-cookie-actions">
-                        <div className="qq-cookie-note">
-                          导入后将保存到本地安全会话。
-                        </div>
-                        <button
-                          id="qq-cookie-save-btn"
-                          className="modal-btn primary"
-                          type="button"
-                          disabled={authBusy}
-                          onClick={() => {
-                            handleSubmitCookie().catch(() => {});
-                          }}
-                        >
-                          保存 Cookie
-                        </button>
-                      </div>
-                    </div>
-                  )}
+                      }}
+                    >
+                      <b>{PROVIDERS.find((p) => p.key === provider)?.code}</b>
+                      <span>
+                        {provider === 'netease' || provider === 'qishui'
+                          ? '点击获取扫码二维码'
+                          : '打开官方扫码窗口'}
+                      </span>
+                    </button>
+                  </div>
                 </div>
 
                 <div className="btn-row login-auth-actions">
@@ -776,15 +914,18 @@ export function AccountAndLoginModal({
       {cinematic && (
         <div
           id="login-easter-unlock-cinematic"
-          className="login-easter-unlock-cinematic show"
-          role="status"
-          aria-live="polite"
+          className="login-easter-unlock-cinematic is-mounted is-positioned is-extracting is-ready"
+          role="button"
+          tabIndex={-1}
+          aria-label="世界和平，点击继续"
+          onClick={() => setCinematic(false)}
         >
-          <span className="login-easter-eyes" aria-hidden="true">
-            <i className="login-easter-eye login-easter-eye-big" />
-            <i className="login-easter-eye login-easter-eye-small" />
-          </span>
-          <b>世界和平</b>
+          <div id="login-easter-unlock-phrase" className="login-easter-unlock-phrase" aria-hidden="true">
+            <span>世</span>
+            <span>界</span>
+            <span>和</span>
+            <span>平</span>
+          </div>
         </div>
       )}
 
