@@ -71,6 +71,8 @@ export function PlayerControls({
   const playQueue = usePlayerStore((s) => s.playQueue);
   const currentIdx = usePlayerStore((s) => s.currentIdx);
   const fx = usePlayerStore((s) => s.fx);
+  const controlsHidden = usePlayerStore((s) => s.controlsHidden);
+  const immersiveMode = usePlayerStore((s) => s.immersiveMode);
 
   const togglePlay = usePlayerStore((s) => s.togglePlay);
   const nextTrack = usePlayerStore((s) => s.nextTrack);
@@ -88,16 +90,24 @@ export function PlayerControls({
   const setPlaylistPanelOpen = usePlayerStore((s) => s.setPlaylistPanelOpen);
   const updateFx = usePlayerStore((s) => s.updateFx);
   const playSong = usePlayerStore((s) => s.playSong);
+  const openTrackDetail = usePlayerStore((s) => s.openTrackDetail);
+  const setControlsHidden = usePlayerStore((s) => s.setControlsHidden);
+  const setImmersiveMode = usePlayerStore((s) => s.setImmersiveMode);
 
   const [likedKeys, setLikedKeys] = useState<Record<string, boolean>>({});
   const [qualityOpen, setQualityOpen] = useState(false);
   const [volumeOpen, setVolumeOpen] = useState(false);
   const [miniQueueOpen, setMiniQueueOpen] = useState(false);
+  const [sourceSwitcherOpen, setSourceSwitcherOpen] = useState(false);
+  const [sourceProvider, setSourceProvider] = useState<'netease' | 'qq' | 'kugou' | 'qishui'>('netease');
+  const [sourceResults, setSourceResults] = useState<SongRecord[]>([]);
+  const [sourceLoading, setSourceLoading] = useState(false);
   const [dragRatio, setDragRatio] = useState<number | null>(null);
 
   const progressBarRef = useRef<HTMLDivElement | null>(null);
   const controlsRootRef = useRef<HTMLDivElement | null>(null);
   const dragRatioRef = useRef<number | null>(null);
+  const suppressNextClickRef = useRef(false);
 
   useEffect(() => {
     const onDocDown = (e: MouseEvent) => {
@@ -106,6 +116,7 @@ export function PlayerControls({
         setQualityOpen(false);
         setVolumeOpen(false);
         setMiniQueueOpen(false);
+        setSourceSwitcherOpen(false);
       }
     };
     document.addEventListener('mousedown', onDocDown);
@@ -125,6 +136,7 @@ export function PlayerControls({
 
   const handleProgressPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!duration) return;
+    suppressNextClickRef.current = true;
     const ratio = computeRatioFromClientX(e.clientX);
     dragRatioRef.current = ratio;
     setDragRatio(ratio);
@@ -143,6 +155,9 @@ export function PlayerControls({
       if (duration > 0) {
         seekTo(finalRatio * duration);
       }
+      window.setTimeout(() => {
+        suppressNextClickRef.current = false;
+      }, 150);
     };
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
@@ -161,19 +176,91 @@ export function PlayerControls({
     const nextLiked = !isLiked;
     setLikedKeys((prev) => ({ ...prev, [currentKey]: nextLiked }));
     try {
-      if (currentSong.provider === 'netease' && currentSong.id) {
-        await apiJson(`/api/like?id=${encodeURIComponent(String(currentSong.id))}&like=${nextLiked}`);
-      } else if (currentSong.provider === 'kugou' && currentSong.hash) {
+      const provider = String(currentSong.provider || currentSong.source || 'netease').toLowerCase();
+      if (provider === 'qq') {
+        await apiJson('/api/qq/like', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            id: currentSong.id ?? currentSong.qqId,
+            mid: currentSong.mid ?? currentSong.songmid,
+            like: nextLiked,
+            song: currentSong,
+          }),
+        });
+      } else if (provider === 'kugou') {
         await apiJson('/api/kugou/song/like', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ hash: currentSong.hash, like: nextLiked }),
+          body: JSON.stringify({
+            hash: currentSong.hash ?? currentSong.fileHash ?? currentSong.id,
+            id: currentSong.id,
+            like: nextLiked,
+            song: currentSong,
+          }),
+        });
+      } else if (provider === 'qishui') {
+        await apiJson('/api/qishui/song/like', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            id: currentSong.id ?? currentSong.trackId,
+            trackId: currentSong.trackId ?? currentSong.id,
+            like: nextLiked,
+            song: currentSong,
+          }),
+        });
+      } else {
+        await apiJson('/api/song/like', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            id: currentSong.id,
+            like: nextLiked,
+            song: currentSong,
+          }),
         });
       }
     } catch {
       // keep optimistic UI toggle
     }
     onToast?.(nextLiked ? `已喜欢：${currentSong.name}` : `已取消喜欢：${currentSong.name}`);
+  };
+
+  const fetchAlternativeSources = async (targetProvider: 'netease' | 'qq' | 'kugou' | 'qishui') => {
+    setSourceProvider(targetProvider);
+    if (!currentSong) {
+      setSourceResults([]);
+      return;
+    }
+    const kw = `${currentSong.name || currentSong.title || ''} ${currentSong.artist || ''}`.trim();
+    if (!kw) return;
+    setSourceLoading(true);
+    try {
+      const endpoint =
+        targetProvider === 'qq'
+          ? `/api/qq/search?keywords=${encodeURIComponent(kw)}&limit=12`
+          : targetProvider === 'kugou'
+          ? `/api/kugou/search?keywords=${encodeURIComponent(kw)}&limit=12`
+          : targetProvider === 'qishui'
+          ? `/api/qishui/search?keywords=${encodeURIComponent(kw)}&limit=12`
+          : `/api/search?keywords=${encodeURIComponent(kw)}&limit=12`;
+      const res = await apiJson<{
+        songs?: SongRecord[];
+        tracks?: SongRecord[];
+        results?: SongRecord[];
+        data?: { songs?: SongRecord[] };
+      }>(endpoint, { timeoutMs: 10000 });
+      const list = (res.songs || res.tracks || res.results || res.data?.songs || []).map((item) => ({
+        ...item,
+        provider: item.provider || targetProvider,
+      }));
+      setSourceResults(list);
+    } catch {
+      setSourceResults([]);
+    } finally {
+      setSourceLoading(false);
+    }
   };
 
   const activeQualityMeta = QUALITY_OPTIONS.find((q) => q.value === quality) || QUALITY_OPTIONS[2];
@@ -187,12 +274,18 @@ export function PlayerControls({
         type="button"
         aria-label="展开播放器控制台"
         title="播放器控制台"
-        onClick={() => setPlaylistPanelOpen(!playlistPanelOpen)}
+        onClick={() => {
+          if (controlsHidden) {
+            setControlsHidden(false);
+            return;
+          }
+          setPlaylistPanelOpen(!playlistPanelOpen);
+        }}
       >
         <span />
       </button>
 
-      <div id="bottom-bar" className={visible ? 'visible' : 'soft-hidden'}>
+      <div id="bottom-bar" className={visible && !controlsHidden ? 'visible' : 'soft-hidden'}>
         <div
           id="mini-queue-popover"
           className={`mini-queue-popover${miniQueueOpen ? ' show' : ''}`}
@@ -251,6 +344,10 @@ export function PlayerControls({
           tabIndex={0}
           onPointerDown={handleProgressPointerDown}
           onClick={(e) => {
+            if (suppressNextClickRef.current) {
+              suppressNextClickRef.current = false;
+              return;
+            }
             if (!duration) return;
             const ratio = computeRatioFromClientX(e.clientX);
             seekTo(ratio * duration);
@@ -273,14 +370,14 @@ export function PlayerControls({
                 className={`control-cover${coverSrc ? '' : ' cover-empty'}`}
                 role="button"
                 tabIndex={0}
-                title="歌单队列"
-                aria-label="打开歌单队列"
+                title="查看歌曲详情"
+                aria-label="查看歌曲详情"
                 style={coverSrc ? { backgroundImage: `url("${coverSrc}")` } : undefined}
-                onClick={() => setPlaylistPanelOpen(!playlistPanelOpen)}
+                onClick={() => openTrackDetail(currentSong || undefined)}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' || e.key === ' ') {
                     e.preventDefault();
-                    setPlaylistPanelOpen(!playlistPanelOpen);
+                    openTrackDetail(currentSong || undefined);
                   }
                 }}
               />
@@ -290,11 +387,125 @@ export function PlayerControls({
                     {currentSong ? currentSong.name || currentSong.title : 'Mineradio'}
                   </span>
                   <span id="control-title-badges" className="control-title-badges">
-                    {currentSong?.provider && (
-                      <span className="tag-source">
-                        {String(currentSong.provider).toUpperCase()}
-                      </span>
-                    )}
+                    <div
+                      id="control-source-switcher"
+                      className={`control-source-switcher${sourceSwitcherOpen ? ' open' : ''}`}
+                    >
+                      <button
+                        id="control-source-btn"
+                        type="button"
+                        className="tag-source control-source-btn"
+                        title="跨平台搜歌换源"
+                        aria-label="跨平台搜歌换源"
+                        aria-expanded={sourceSwitcherOpen}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          const nextOpen = !sourceSwitcherOpen;
+                          setSourceSwitcherOpen(nextOpen);
+                          if (nextOpen && currentSong) {
+                            const initProvider =
+                              currentSong.provider === 'qq' ||
+                              currentSong.provider === 'kugou' ||
+                              currentSong.provider === 'qishui'
+                                ? currentSong.provider
+                                : 'netease';
+                            fetchAlternativeSources(initProvider).catch(() => {});
+                          }
+                        }}
+                      >
+                        {String(currentSong?.provider || 'NETEASE').toUpperCase()}
+                      </button>
+
+                      {sourceSwitcherOpen && (
+                        <div
+                          id="control-source-popover"
+                          className="control-source-popover quality-popover"
+                          onClick={(e) => e.stopPropagation()}
+                          style={{
+                            minWidth: 260,
+                            maxWidth: 320,
+                            padding: 10,
+                            zIndex: 80,
+                          }}
+                        >
+                          <div
+                            className="control-source-tabs"
+                            style={{ display: 'flex', gap: 6, marginBottom: 8 }}
+                          >
+                            {(
+                              [
+                                { id: 'netease', label: '网易云' },
+                                { id: 'qq', label: 'QQ' },
+                                { id: 'kugou', label: '酷狗' },
+                                { id: 'qishui', label: '汽水' },
+                              ] as const
+                            ).map((tab) => (
+                              <button
+                                key={tab.id}
+                                type="button"
+                                className={`fx-mini-btn${sourceProvider === tab.id ? ' active' : ' ghost'}`}
+                                style={{ flex: 1, height: 26, fontSize: 11, padding: '0 6px' }}
+                                onClick={() => {
+                                  fetchAlternativeSources(tab.id).catch(() => {});
+                                }}
+                              >
+                                {tab.label}
+                              </button>
+                            ))}
+                          </div>
+                          <div
+                            className="control-source-results"
+                            style={{ maxHeight: 210, overflowY: 'auto' }}
+                          >
+                            {!currentSong ? (
+                              <div className="search-empty" style={{ padding: '12px 6px', fontSize: 12 }}>
+                                请先播放一首歌曲以搜索换源
+                              </div>
+                            ) : sourceLoading ? (
+                              <div className="search-empty" style={{ padding: '12px 6px', fontSize: 12 }}>
+                                正在检索同名音源…
+                              </div>
+                            ) : sourceResults.length === 0 ? (
+                              <div className="search-empty" style={{ padding: '12px 6px', fontSize: 12 }}>
+                                未找到可用替代音源
+                              </div>
+                            ) : (
+                              sourceResults.map((cand, i) => (
+                                <button
+                                  key={`${songIdentityKey(cand)}-${i}`}
+                                  type="button"
+                                  className="quality-option"
+                                  style={{
+                                    width: '100%',
+                                    textAlign: 'left',
+                                    display: 'flex',
+                                    flexDirection: 'column',
+                                    alignItems: 'flex-start',
+                                    gap: 2,
+                                    padding: '6px 8px',
+                                  }}
+                                  onClick={() => {
+                                    onSongSelected?.(cand);
+                                    playSong(cand).catch(() => {});
+                                    setSourceSwitcherOpen(false);
+                                    onToast?.(
+                                      `已切换至 ${String(cand.provider || sourceProvider).toUpperCase()} 音源：${
+                                        cand.name || cand.title
+                                      }`
+                                    );
+                                  }}
+                                >
+                                  <strong style={{ fontSize: 12 }}>{cand.name || cand.title}</strong>
+                                  <span style={{ fontSize: 11, opacity: 0.72 }}>
+                                    {cand.artist || '未知歌手'} · {String(cand.provider || sourceProvider).toUpperCase()}
+                                  </span>
+                                </button>
+                              ))
+                            )}
+                          </div>
+                        </div>
+                      )}
+                    </div>
                   </span>
                   <div
                     id="quality-control"
@@ -676,6 +887,43 @@ export function PlayerControls({
                 </div>
               </div>
             </div>
+
+            <button
+              id="immersive-btn"
+              className={`ctrl-btn${immersiveMode ? ' active' : ''}`}
+              type="button"
+              onClick={() => {
+                const next = !immersiveMode;
+                setImmersiveMode(next);
+                onToast?.(next ? '已进入纯净沉浸模式（Esc 退出）' : '已退出沉浸模式');
+              }}
+              title={immersiveMode ? '退出沉浸模式' : '纯净沉浸模式'}
+              aria-label="沉浸模式"
+              aria-pressed={immersiveMode}
+            >
+              <svg width="18" height="18" fill="none" stroke="currentColor" strokeWidth="1.9" viewBox="0 0 24 24">
+                <circle cx="12" cy="12" r="3" />
+                <path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6z" />
+              </svg>
+            </button>
+
+            <button
+              id="controls-hide-btn"
+              className={`ctrl-btn${controlsHidden ? ' active' : ''}`}
+              type="button"
+              onClick={() => {
+                const next = !controlsHidden;
+                setControlsHidden(next);
+                onToast?.(next ? '已隐藏底部控制台（点击底部细柄恢复）' : '已显示底部控制台');
+              }}
+              title={controlsHidden ? '显示控制台' : '隐藏控制台'}
+              aria-label="隐藏控制台"
+              aria-pressed={controlsHidden}
+            >
+              <svg width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path d="M6 9l6 6 6-6" />
+              </svg>
+            </button>
 
             <button
               className="ctrl-btn fullscreen-toggle-btn"
