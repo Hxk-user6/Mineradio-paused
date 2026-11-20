@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { coverProxyUrl } from '../bridge/tauriBridge';
+import { apiJson, coverProxyUrl } from '../bridge/tauriBridge';
 import { songIdentityKey, visualEngine } from '../engines';
 import { usePlayerStore } from '../store/playerStore';
 import type { SearchMode, SongRecord } from '../types/mineradio';
@@ -20,6 +20,39 @@ const SEARCH_TABS: Array<{ id: string; mode: SearchMode; label: string }> = [
 ];
 
 const PAGE_SIZE = 8;
+
+interface PodcastRadio {
+  id: string | number;
+  name: string;
+  cover?: string;
+  desc?: string;
+  programCount?: number;
+  dj?: string;
+}
+
+function normalizeRadio(raw: Record<string, unknown>): PodcastRadio | null {
+  const id = (raw.id ?? raw.radioId ?? raw.podcastId) as string | number | undefined;
+  if (id === undefined || id === null || id === '') return null;
+  return {
+    id,
+    name: String(raw.name || raw.title || '未命名电台'),
+    cover: String(raw.cover || raw.picUrl || raw.coverUrl || ''),
+    desc: String(raw.desc || raw.description || raw.rcmdText || ''),
+    programCount: Number(raw.programCount || raw.trackCount || 0) || undefined,
+    dj: String(raw.dj || raw.artist || raw.nickname || ''),
+  };
+}
+
+function pickArray(res: Record<string, unknown>, keys: string[]): Array<Record<string, unknown>> {
+  for (const k of keys) {
+    const v = res[k];
+    if (Array.isArray(v)) return v as Array<Record<string, unknown>>;
+  }
+  const data = res.data;
+  if (Array.isArray(data)) return data as Array<Record<string, unknown>>;
+  if (data && typeof data === 'object') return pickArray(data as Record<string, unknown>, keys);
+  return [];
+}
 
 function providerLabel(song: SongRecord): string {
   const p = String(song.provider || song.source || '').toLowerCase();
@@ -47,6 +80,15 @@ export function SearchBar({
   const searchTracks = usePlayerStore((s) => s.searchTracks);
   const playSong = usePlayerStore((s) => s.playSong);
   const importLocalFiles = usePlayerStore((s) => s.importLocalFiles);
+  const searchHistory = usePlayerStore((s) => s.searchHistory);
+  const addSearchHistory = usePlayerStore((s) => s.addSearchHistory);
+  const clearSearchHistory = usePlayerStore((s) => s.clearSearchHistory);
+  const [hotRadios, setHotRadios] = useState<PodcastRadio[]>([]);
+  const [hotLoading, setHotLoading] = useState(false);
+  const [openRadioId, setOpenRadioId] = useState<string | number | null>(null);
+  const [radioPrograms, setRadioPrograms] = useState<SongRecord[]>([]);
+  const [programsLoading, setProgramsLoading] = useState(false);
+  const [likedKeys, setLikedKeys] = useState<Record<string, boolean>>({});
 
   const [resultsOpen, setResultsOpen] = useState(false);
   const [hasSearched, setHasSearched] = useState(false);
@@ -77,6 +119,101 @@ export function SearchBar({
     return () => document.removeEventListener('mousedown', onDocPointerDown);
   }, []);
 
+  const podcastBrowse = searchMode === 'podcast' && !searchQuery.trim();
+
+  useEffect(() => {
+    if (!podcastBrowse) return;
+    let cancelled = false;
+    setHotLoading(true);
+    apiJson<Record<string, unknown>>('/api/podcast/hot?limit=24', { timeoutMs: 8000 })
+      .then((res) => {
+        if (cancelled) return;
+        const list = pickArray(res || {}, ['podcasts', 'radios', 'djRadios', 'list', 'items'])
+          .map(normalizeRadio)
+          .filter((r): r is PodcastRadio => Boolean(r));
+        setHotRadios(list);
+      })
+      .catch(() => {
+        if (!cancelled) setHotRadios([]);
+      })
+      .finally(() => {
+        if (!cancelled) setHotLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [podcastBrowse]);
+
+  const toggleRadio = async (radio: PodcastRadio) => {
+    if (openRadioId === radio.id) {
+      setOpenRadioId(null);
+      setRadioPrograms([]);
+      return;
+    }
+    setOpenRadioId(radio.id);
+    setRadioPrograms([]);
+    setProgramsLoading(true);
+    try {
+      const res = await apiJson<Record<string, unknown>>(
+        `/api/podcast/programs?id=${encodeURIComponent(String(radio.id))}&limit=30`,
+        { timeoutMs: 10000 }
+      );
+      const list = pickArray(res || {}, ['programs', 'songs', 'tracks', 'list']) as unknown as SongRecord[];
+      setRadioPrograms(
+        list.map((p) => ({
+          ...p,
+          provider: p.provider || 'netease',
+          type: 'podcast',
+          podcastId: p.podcastId ?? radio.id,
+          cover: p.cover || radio.cover,
+        }))
+      );
+    } catch {
+      onToast?.('读取电台节目失败');
+    } finally {
+      setProgramsLoading(false);
+    }
+  };
+
+  const handleLikeResult = async (song: SongRecord, e: React.MouseEvent) => {
+    e.stopPropagation();
+    const key = songIdentityKey(song);
+    const provider = String(song.provider || song.source || 'netease').toLowerCase();
+    const id = song.id ?? song.mid ?? song.songmid ?? song.hash;
+    const next = !likedKeys[key];
+    try {
+      if (provider === 'qq') {
+        await apiJson('/api/qq/like', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id, mid: song.mid || song.songmid, like: next }),
+        });
+      } else if (provider === 'kugou') {
+        await apiJson('/api/kugou/song/like', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ hash: song.hash || song.fileHash, id, like: next }),
+        });
+      } else if (provider === 'qishui') {
+        await apiJson('/api/qishui/song/like', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id, like: next }),
+        });
+      } else {
+        await apiJson('/api/song/like', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id, like: next }),
+        });
+      }
+      setLikedKeys((prev) => ({ ...prev, [key]: next }));
+      onToast?.(next ? `已喜欢：${song.name}` : `已取消喜欢：${song.name}`);
+    } catch (err) {
+      onToast?.(`操作失败：${(err as Error)?.message || '请先登录对应平台'}`);
+    }
+  };
+
   const totalPages = Math.max(1, Math.ceil(searchResults.length / PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
   const pagedResults = useMemo(() => {
@@ -98,6 +235,7 @@ export function SearchBar({
     setHasSearched(true);
     setResultsOpen(true);
     setPage(1);
+    addSearchHistory(trimmed);
     await searchTracks(query, mode);
   };
 
@@ -284,6 +422,109 @@ export function SearchBar({
           })}
         </div>
 
+        {searchHistory.length > 0 && !searchQuery.trim() && (
+          <div id="search-history" className="search-history" aria-label="搜索历史">
+            {searchHistory.slice(0, 8).map((kw) => (
+              <button
+                key={kw}
+                type="button"
+                className="search-history-chip"
+                onClick={() => {
+                  setSearchQuery(kw);
+                  runSearch(kw, searchMode).catch(() => {});
+                }}
+              >
+                {kw}
+              </button>
+            ))}
+            <button
+              type="button"
+              className="search-history-chip clear"
+              onClick={() => clearSearchHistory()}
+              aria-label="清空搜索历史"
+            >
+              清空
+            </button>
+          </div>
+        )}
+
+        {podcastBrowse && (
+          <div id="podcast-browse" className="show search-podcast-browse">
+            {hotLoading ? (
+              <div className="search-empty">正在读取热门电台...</div>
+            ) : hotRadios.length === 0 ? (
+              <div className="search-empty">暂无热门电台</div>
+            ) : (
+              hotRadios.map((radio) => (
+                <div key={String(radio.id)} className="podcast-radio-block">
+                  <div
+                    className="search-result"
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => {
+                      toggleRadio(radio).catch(() => {});
+                    }}
+                  >
+                    {radio.cover ? (
+                      <img src={coverProxyUrl(radio.cover)} alt={radio.name} loading="lazy" />
+                    ) : (
+                      <div style={{ width: 40, height: 40, flexShrink: 0 }}>♪</div>
+                    )}
+                    <div className="search-result-info">
+                      <div className="search-result-title">
+                        <span>{radio.name}</span>
+                        <span className="tag-source">播客</span>
+                      </div>
+                      <div className="search-result-meta">
+                        {radio.dj || radio.desc || ''}
+                        {radio.programCount ? ` · ${radio.programCount} 期` : ''}
+                      </div>
+                    </div>
+                    <span aria-hidden="true">{openRadioId === radio.id ? '▾' : '▸'}</span>
+                  </div>
+                  {openRadioId === radio.id && (
+                    <div className="podcast-programs">
+                      {programsLoading ? (
+                        <div className="search-empty">正在读取节目...</div>
+                      ) : radioPrograms.length === 0 ? (
+                        <div className="search-empty">暂无节目</div>
+                      ) : (
+                        radioPrograms.map((prog, i) => (
+                          <div
+                            key={songIdentityKey(prog) || i}
+                            className="search-result"
+                            role="button"
+                            tabIndex={0}
+                            onClick={() => {
+                              onSongSelected?.(prog);
+                              playSong(prog, radioPrograms).catch(() => {});
+                            }}
+                          >
+                            <div className="search-result-info">
+                              <div className="search-result-title">
+                                <span>{prog.name || prog.title || '未命名节目'}</span>
+                              </div>
+                              <div className="search-result-meta">{prog.artist || radio.name}</div>
+                            </div>
+                            <button
+                              type="button"
+                              className="fx-mini-btn ghost"
+                              style={{ height: 26, padding: '0 8px', fontSize: 11 }}
+                              onClick={(e) => handleAppendQueue(prog, e)}
+                            >
+                              +队列
+                            </button>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  )}
+                </div>
+              ))
+            )}
+          </div>
+        )}
+
         <div id="search-results" className={showResults ? 'show' : undefined}>
           {searchLoading ? (
             <div className="search-empty">正在检索曲库...</div>
@@ -350,6 +591,21 @@ export function SearchBar({
                         onClick={(e) => handleAppendQueue(song, e)}
                       >
                         +队列
+                      </button>
+                      <button
+                        type="button"
+                        className={`fx-mini-btn ghost search-like-btn${
+                          likedKeys[songIdentityKey(song)] ? ' liked' : ''
+                        }`}
+                        style={{ height: 26, padding: '0 8px', fontSize: 11 }}
+                        title="喜欢"
+                        aria-label="喜欢"
+                        aria-pressed={Boolean(likedKeys[songIdentityKey(song)])}
+                        onClick={(e) => {
+                          handleLikeResult(song, e).catch(() => {});
+                        }}
+                      >
+                        {likedKeys[songIdentityKey(song)] ? '♥' : '♡'}
                       </button>
                       {onOpenCollect && (
                         <button
