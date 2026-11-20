@@ -8,6 +8,7 @@ import { PlaylistDrawer } from './components/PlaylistDrawer';
 import { SearchBar } from './components/SearchBar';
 import { SplashScreen } from './components/SplashScreen';
 import { TitleBar } from './components/TitleBar';
+import { TrackDetailModal } from './components/TrackDetailModal';
 import { coverProxyUrl, desktopWindow, resolveMediaUrl } from './bridge/tauriBridge';
 import { gestureEngine, visualEngine } from './engines';
 import { applyFxCssVariables, usePlayerStore } from './store/playerStore';
@@ -904,7 +905,7 @@ export function App(): React.ReactElement {
           onSongSelected={() => setShowHome(false)}
         />
 
-        {/* TrackDetailModal 挂载占位：由主控在汇总阶段挂载 <TrackDetailModal onToast={showToast} /> */}
+        <TrackDetailModal onToast={showToast} />
 
         <div id="toast" className={toastMsg ? 'show' : undefined} role="status" aria-live="polite">
           {toastMsg}
