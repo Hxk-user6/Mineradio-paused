@@ -365,8 +365,13 @@ pub fn run() {
             .min_inner_size(960.0, 620.0)
             .decorations(false)
             .transparent(true)
+            .visible(true)
+            .focused(true)
             .center()
             .build()?;
+
+            let _ = main_win.show();
+            let _ = main_win.set_focus();
 
             let app_handle = app.handle().clone();
             let state_for_close = tauri_state.clone();
