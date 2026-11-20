@@ -1,12 +1,14 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { desktopWindow, listenEvent } from './bridge/tauriBridge';
-import type { DesktopLyricsPayload } from './types/mineradio';
+import type { DesktopLyricsPayload, LyricWord } from './types/mineradio';
 
 export interface DesktopLyricsStatePayload extends DesktopLyricsPayload {
   text?: string;
   locked?: boolean;
   enabled?: boolean;
   clickThrough?: boolean;
+  words?: LyricWord[];
+  payload?: DesktopLyricsStatePayload | null;
 }
 
 const DESKTOP_LYRICS_CSS = `
@@ -17,6 +19,7 @@ const DESKTOP_LYRICS_CSS = `
   --lyric-font: Inter, "Noto Sans SC", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
   --lyric-size: 46px;
   --lyric-progress: 0%;
+  --lyric-y: 76%;
 }
 html, body, #lyrics-root {
   margin: 0;
@@ -42,7 +45,11 @@ html, body, #lyrics-root {
   box-sizing: border-box;
   text-align: center;
   border-radius: 20px;
-  transition: background 0.18s ease, box-shadow 0.18s ease;
+  transition: background 0.18s ease, box-shadow 0.18s ease, transform 0.18s ease;
+}
+.desktop-lyrics-stage.cinema {
+  letter-spacing: 0.04em;
+  filter: drop-shadow(0 6px 22px rgba(0, 0, 0, 0.85));
 }
 .desktop-lyrics-stage.unlocked {
   cursor: move;
@@ -108,6 +115,24 @@ html, body, #lyrics-root {
   -webkit-text-fill-color: transparent;
   filter: drop-shadow(0 2px 8px rgba(0, 0, 0, 0.65));
 }
+.desktop-lyrics-stage.highlight-off .desktop-lyrics-main {
+  background: none;
+  -webkit-text-fill-color: var(--lyric-primary);
+  color: var(--lyric-primary);
+}
+.desktop-lyrics-word {
+  display: inline-block;
+  background: linear-gradient(
+    90deg,
+    var(--lyric-highlight) 0%,
+    var(--lyric-highlight) var(--word-progress, 0%),
+    var(--lyric-primary) var(--word-progress, 0%),
+    var(--lyric-primary) 100%
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
 .desktop-lyrics-stage.paused .desktop-lyrics-main {
   opacity: 0.82;
 }
@@ -129,15 +154,32 @@ html, body, #lyrics-root {
 }
 `;
 
+function computeWordProgress(word: LyricWord, currentTime: number, lineProgress: number): number {
+  const span = Math.max(0.05, word.end - word.start);
+  if (currentTime > 0 || word.start > 0) {
+    if (currentTime <= word.start) return 0;
+    if (currentTime >= word.end) return 1;
+    return Math.max(0, Math.min(1, (currentTime - word.start) / span));
+  }
+  return lineProgress;
+}
+
 export function DesktopLyricsApp(): React.ReactElement {
   const [lyricText, setLyricText] = useState('Mineradio');
   const [translation, setTranslation] = useState('');
   const [nextLine, setNextLine] = useState('');
+  const [words, setWords] = useState<LyricWord[]>([]);
+  const [currentTime, setCurrentTime] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [progress, setProgress] = useState(0);
   const [sizeScale, setSizeScale] = useState(1);
   const [opacity, setOpacity] = useState(0.92);
+  const [yPos, setYPos] = useState(0.76);
+  const [cinema, setCinema] = useState(false);
+  const [highlight, setHighlight] = useState(true);
+  const [fps, setFps] = useState(0);
   const [locked, setLocked] = useState(false);
+  const [enabled, setEnabled] = useState(true);
   const [hovered, setHovered] = useState(false);
 
   const dragRef = useRef<{ active: boolean; pointerId: number | null; x: number; y: number }>({
@@ -148,8 +190,18 @@ export function DesktopLyricsApp(): React.ReactElement {
   });
 
   useEffect(() => {
-    const applyPayload = (payload: DesktopLyricsStatePayload) => {
-      if (!payload || typeof payload !== 'object') return;
+    let cancelled = false;
+
+    const applyPayload = (rawPayload: DesktopLyricsStatePayload | null | undefined) => {
+      if (cancelled || !rawPayload || typeof rawPayload !== 'object') return;
+      const payload: DesktopLyricsStatePayload =
+        rawPayload.payload && typeof rawPayload.payload === 'object'
+          ? { ...rawPayload, ...rawPayload.payload }
+          : rawPayload;
+
+      if (typeof payload.enabled === 'boolean') {
+        setEnabled(payload.enabled);
+      }
       const nextText = payload.line ?? payload.text ?? payload.title;
       if (typeof nextText === 'string' && nextText.trim()) {
         setLyricText(nextText);
@@ -159,6 +211,14 @@ export function DesktopLyricsApp(): React.ReactElement {
       }
       if (typeof payload.nextLine === 'string') {
         setNextLine(payload.nextLine);
+      }
+      if (Array.isArray(payload.words)) {
+        setWords(payload.words);
+      } else if (typeof nextText === 'string' && nextText.trim()) {
+        setWords([]);
+      }
+      if (typeof payload.currentTime === 'number' && Number.isFinite(payload.currentTime)) {
+        setCurrentTime(Math.max(0, payload.currentTime));
       }
       if (typeof payload.playing === 'boolean') {
         setPlaying(payload.playing);
@@ -178,6 +238,18 @@ export function DesktopLyricsApp(): React.ReactElement {
       if (typeof payload.opacity === 'number' && Number.isFinite(payload.opacity)) {
         setOpacity(Math.max(0.28, Math.min(1, payload.opacity)));
       }
+      if (typeof payload.y === 'number' && Number.isFinite(payload.y)) {
+        setYPos(Math.max(0, Math.min(1, payload.y)));
+      }
+      if (typeof payload.cinema === 'boolean') {
+        setCinema(payload.cinema);
+      }
+      if (typeof payload.highlight === 'boolean') {
+        setHighlight(payload.highlight);
+      }
+      if (typeof payload.fps === 'number' && Number.isFinite(payload.fps)) {
+        setFps(Math.max(0, Math.round(payload.fps)));
+      }
       if (typeof payload.locked === 'boolean') {
         setLocked(payload.locked);
       } else if (typeof payload.clickThrough === 'boolean') {
@@ -185,14 +257,24 @@ export function DesktopLyricsApp(): React.ReactElement {
       }
     };
 
+    // 挂载时立即主动拉取初始桌面歌词状态，避免悬浮窗首帧空白
+    desktopWindow
+      .desktopLyricsGetState()
+      .then((res) => {
+        if (cancelled || !res) return;
+        applyPayload(res as unknown as DesktopLyricsStatePayload);
+      })
+      .catch(() => {});
+
     const unlisteners: Array<() => void> = [];
-    let cancelled = false;
 
     Promise.all([
       listenEvent<DesktopLyricsStatePayload>('mineradio-desktop-lyrics-state', applyPayload),
       listenEvent<DesktopLyricsStatePayload>('mineradio-desktop-lyrics-update', applyPayload),
       listenEvent<{ locked: boolean }>('mineradio-desktop-lyrics-lock-state', (p) => {
-        if (typeof p?.locked === 'boolean') setLocked(p.locked);
+        if (!cancelled && typeof p?.locked === 'boolean') {
+          setLocked(p.locked);
+        }
       }),
     ])
       .then((fns) => {
@@ -255,21 +337,33 @@ export function DesktopLyricsApp(): React.ReactElement {
 
   const progressPct = `${(progress * 100).toFixed(2)}%`;
   const fontSizePx = `${Math.round(46 * sizeScale)}px`;
+  const yPct = `${(yPos * 100).toFixed(1)}%`;
 
   return (
     <>
       <style>{DESKTOP_LYRICS_CSS}</style>
-      <div className="wrap desktop-lyrics-wrap" style={{ opacity }}>
+      <div
+        className="wrap desktop-lyrics-wrap"
+        data-enabled={enabled ? '1' : '0'}
+        style={{ opacity }}
+      >
         <div
           id="stage"
           className={`stage desktop-lyrics-stage${locked ? ' locked' : ' unlocked'}${
             hovered ? ' hint-visible' : ''
-          }${playing ? '' : ' paused'}`}
+          }${playing ? '' : ' paused'}${cinema ? ' cinema' : ''}${
+            highlight ? ' highlight-on' : ' highlight-off'
+          }`}
           aria-label="Mineradio desktop lyrics"
+          data-y={yPos.toFixed(2)}
+          data-cinema={cinema ? '1' : '0'}
+          data-highlight={highlight ? '1' : '0'}
+          data-fps={fps}
           style={
             {
               '--lyric-progress': progressPct,
               '--lyric-size': fontSizePx,
+              '--lyric-y': yPct,
             } as React.CSSProperties
           }
           onMouseEnter={() => setHovered(true)}
@@ -304,8 +398,27 @@ export function DesktopLyricsApp(): React.ReactElement {
 
           <div id="lyricViewport" className="lyric-viewport">
             <div id="lyricScroller" className="lyric-scroll">
-              <div id="line" className="line desktop-lyrics-main" data-text={lyricText}>
-                {lyricText}
+              <div
+                id="line"
+                className="line desktop-lyrics-main"
+                data-text={lyricText}
+                data-testid="desktop-lyrics-line"
+              >
+                {words.length > 0
+                  ? words.map((w, idx) => {
+                      const wp = computeWordProgress(w, currentTime, progress);
+                      return (
+                        <span
+                          key={`${idx}-${w.text}`}
+                          className="desktop-lyrics-word"
+                          data-word-active={wp > 0 && wp < 1 ? '1' : undefined}
+                          style={{ '--word-progress': `${(wp * 100).toFixed(1)}%` } as React.CSSProperties}
+                        >
+                          {w.text}
+                        </span>
+                      );
+                    })
+                  : lyricText}
               </div>
               {translation && (
                 <div className="desktop-lyrics-sub" data-testid="desktop-lyrics-translation">
