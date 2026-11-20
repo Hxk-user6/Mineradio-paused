@@ -35,7 +35,7 @@ export function TitleBar({
     return unlisten;
   }, []);
 
-  const hasUpdate = Boolean(updateInfo?.hasUpdate);
+  const hasUpdate = Boolean(updateInfo?.updateAvailable ?? updateInfo?.hasUpdate);
 
   const handleToggleDiy = () => {
     const next = !diyMode;

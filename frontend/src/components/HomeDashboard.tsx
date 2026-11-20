@@ -29,6 +29,12 @@ const RECOMMEND_PLATFORMS: Array<{ key: RecommendPlatform; label: string }> = [
   { key: 'kugou', label: '酷狗' },
 ];
 
+function dailyList(d: { dailySongs?: SongRecord[]; songs?: SongRecord[] } | null | undefined): SongRecord[] {
+  if (d?.dailySongs?.length) return d.dailySongs;
+  if (d?.songs?.length) return d.songs;
+  return [];
+}
+
 export function HomeDashboard({
   onOpenLibrary,
   onOpenPlayerConsole,
@@ -45,6 +51,22 @@ export function HomeDashboard({
   const playSong = usePlayerStore((s) => s.playSong);
   const togglePlay = usePlayerStore((s) => s.togglePlay);
   const refreshHomeDiscover = usePlayerStore((s) => s.refreshHomeDiscover);
+
+  const dailySongs = useMemo(() => dailyList(homeDiscover), [homeDiscover]);
+  const radioSongs = useMemo<SongRecord[]>(
+    () => (weatherRadio?.radio?.songs?.length ? weatherRadio.radio.songs : weatherRadio?.tracks || []),
+    [weatherRadio]
+  );
+  const weatherObj =
+    weatherRadio?.weather && typeof weatherRadio.weather === 'object' ? weatherRadio.weather : null;
+  const weatherCity = weatherObj?.city || weatherRadio?.city || '';
+  const weatherTemp = weatherObj?.temperature ?? weatherRadio?.temperature;
+  const weatherSummary =
+    weatherObj?.summary ||
+    (typeof weatherRadio?.weather === 'string' ? weatherRadio.weather : '');
+  const radioTitle = weatherRadio?.radio?.title || '';
+  const radioSubtitle = weatherRadio?.radio?.subtitle || weatherRadio?.greeting || '';
+  const homePlaylistCount = (homeDiscover?.playlists?.length || 0) + (homeDiscover?.podcasts?.length || 0);
 
   const [now, setNow] = useState<Date>(() => new Date());
   const [reviewOffset, setReviewOffset] = useState(0);
@@ -102,8 +124,8 @@ export function HomeDashboard({
 
   const discoveryTracks = useMemo<SongRecord[]>(() => {
     const candidates: SongRecord[] = [];
-    if (homeDiscover?.songs?.length) candidates.push(...homeDiscover.songs);
-    if (weatherRadio?.tracks?.length) candidates.push(...weatherRadio.tracks);
+    if (dailySongs.length) candidates.push(...dailySongs);
+    if (radioSongs.length) candidates.push(...radioSongs);
     if (localTracks.length) candidates.push(...localTracks);
     const seen = new Set<string>();
     const deduped: SongRecord[] = [];
@@ -115,7 +137,7 @@ export function HomeDashboard({
       if (deduped.length >= 3) break;
     }
     return deduped;
-  }, [homeDiscover, weatherRadio, localTracks]);
+  }, [dailySongs, radioSongs, localTracks]);
 
   const totalMinutes = Math.floor((todayListeningStats.totalSeconds || 0) / 60);
   const topArtist = todayListeningStats.topArtists?.[0]?.name || '等待记录';
@@ -166,17 +188,13 @@ export function HomeDashboard({
   };
 
   const handlePlayDaily = async () => {
-    const list = homeDiscover?.songs?.length
-      ? homeDiscover.songs
-      : weatherRadio?.tracks?.length
-      ? weatherRadio.tracks
-      : [];
+    const list = dailySongs.length ? dailySongs : radioSongs;
     if (list.length > 0) {
       onExitHome?.();
       await playSong(0, list);
     } else {
       await refreshHomeDiscover();
-      const updated = usePlayerStore.getState().homeDiscover?.songs || [];
+      const updated = dailyList(usePlayerStore.getState().homeDiscover);
       if (updated.length > 0) {
         onExitHome?.();
         await playSong(0, updated);
@@ -187,7 +205,7 @@ export function HomeDashboard({
   };
 
   const handlePlayWeatherRadio = async () => {
-    const tracks = weatherRadio?.tracks || [];
+    const tracks = radioSongs;
     if (tracks.length > 0) {
       onExitHome?.();
       await playSong(0, tracks);
@@ -200,33 +218,42 @@ export function HomeDashboard({
     setPlatformLoading(true);
     setPlatformStatus('正在读取平台推荐...');
     try {
-      let endpoint = '/api/discover?limit=12';
+      if (source === 'qq') {
+        // QQ 推荐不再调用 /api/qq/recommend，统一使用 /api/discover/home 的聚合结果
+        const fallback = dailyList(usePlayerStore.getState().homeDiscover);
+        setPlatformSongs(fallback);
+        setPlatformStatus(
+          fallback.length ? `已加载 ${fallback.length} 首每日推荐` : 'QQ 暂无独立推荐，请使用每日推荐'
+        );
+        return;
+      }
+      let endpoint = '/api/discover/home';
       if (source === 'qishui') endpoint = '/api/qishui/feed?limit=12';
       else if (source === 'kugou') endpoint = '/api/kugou/recommendations?limit=12';
-      else if (source === 'qq') endpoint = '/api/qq/recommend?limit=12';
 
       const res = await apiJson<{
+        dailySongs?: SongRecord[];
         songs?: SongRecord[];
         tracks?: SongRecord[];
         data?: { songs?: SongRecord[] };
         message?: string;
       }>(endpoint, { timeoutMs: 8000 });
 
-      const list = res.songs || res.tracks || res.data?.songs || [];
+      const list = res.dailySongs?.length ? res.dailySongs : res.songs || res.tracks || res.data?.songs || [];
       if (list.length > 0) {
         setPlatformSongs(list);
         setPlatformStatus(`已加载 ${list.length} 首推荐曲目`);
-      } else if (source === 'netease' && homeDiscover?.songs?.length) {
-        setPlatformSongs(homeDiscover.songs);
-        setPlatformStatus(`已加载 ${homeDiscover.songs.length} 首每日推荐`);
+      } else if (source === 'netease' && dailySongs.length) {
+        setPlatformSongs(dailySongs);
+        setPlatformStatus(`已加载 ${dailySongs.length} 首每日推荐`);
       } else {
         setPlatformSongs([]);
         setPlatformStatus(res.message || '当前平台暂无可用推荐，请确认已登录或后端支持该接口');
       }
     } catch {
-      if (source === 'netease' && homeDiscover?.songs?.length) {
-        setPlatformSongs(homeDiscover.songs);
-        setPlatformStatus(`已加载 ${homeDiscover.songs.length} 首本地缓存推荐`);
+      if (source === 'netease' && dailySongs.length) {
+        setPlatformSongs(dailySongs);
+        setPlatformStatus(`已加载 ${dailySongs.length} 首本地缓存推荐`);
       } else {
         setPlatformSongs([]);
         setPlatformStatus('暂无可用推荐接口');
@@ -356,8 +383,8 @@ export function HomeDashboard({
               <div className="home-card-label">DAILY MIX</div>
               <div className="home-card-title">每日推荐</div>
               <div className="home-card-sub">
-                {homeDiscover?.songs?.length
-                  ? `${homeDiscover.songs.length} 首推荐已就绪`
+                {dailySongs.length
+                  ? `${dailySongs.length} 首推荐已就绪`
                   : '使用当前 Mineradio 推荐数据'}
               </div>
               <div className="home-card-art" />
@@ -416,7 +443,16 @@ export function HomeDashboard({
                       {topArtist}
                     </strong>
                     <span id="home-today-streak" className="home-listen-label">
-                      {todayListeningStats.playCount > 0 ? '今日常听歌手' : '开始播放后生成'}
+                      {todayListeningStats.playCount > 0
+                        ? `今日常听歌手${
+                            (todayListeningStats.topArtists?.length || 0) > 1
+                              ? ` · ${todayListeningStats.topArtists!
+                                  .slice(1, 3)
+                                  .map((a) => a.name)
+                                  .join(' / ')}`
+                              : ''
+                          }`
+                        : '开始播放后生成'}
                     </span>
                   </div>
                 </div>
@@ -523,7 +559,9 @@ export function HomeDashboard({
                   <span className="home-insight-kicker">DISCOVER · 音乐发现</span>
                   <span className="home-ranking-entry-title">平台热歌与推荐中心</span>
                   <span className="home-ranking-entry-sub">
-                    查看跨平台每日推荐歌曲与精选歌单
+                    {homePlaylistCount > 0
+                      ? `${homePlaylistCount} 个推荐歌单与播客电台`
+                      : '查看跨平台每日推荐歌曲与精选歌单'}
                   </span>
                 </span>
                 <span className="home-ranking-entry-art" aria-hidden="true">
@@ -549,19 +587,18 @@ export function HomeDashboard({
                 <span className="home-ranking-entry-copy">
                   <span className="home-insight-kicker">
                     WEATHER RADIO · 天气电台
-                    {weatherRadio?.city ? ` · ${weatherRadio.city}` : ''}
+                    {weatherCity ? ` · ${weatherCity}` : ''}
                   </span>
                   <span className="home-ranking-entry-title">
-                    {weatherRadio?.weather
-                      ? `${weatherRadio.weather}${
-                          weatherRadio.temperature != null ? ` ${weatherRadio.temperature}°` : ''
-                        }`
-                      : '天气电台 / 平台推荐'}
+                    {radioTitle ||
+                      (weatherSummary
+                        ? `${weatherSummary}${weatherTemp != null ? ` ${weatherTemp}°` : ''}`
+                        : '天气电台 / 平台推荐')}
                   </span>
                   <span className="home-ranking-entry-sub">
-                    {weatherRadio?.greeting ||
-                      (weatherRadio?.tracks?.length
-                        ? `${weatherRadio.tracks.length} 首场景电台曲目，点击立即收听`
+                    {radioSubtitle ||
+                      (radioSongs.length
+                        ? `${radioSongs.length} 首场景电台曲目，点击立即收听`
                         : '读取当前气候情绪曲目，或查看平台推荐')}
                   </span>
                 </span>
