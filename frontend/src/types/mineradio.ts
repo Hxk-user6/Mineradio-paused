@@ -87,11 +87,18 @@ export interface PlaylistSummary {
   tracks?: SongRecord[];
 }
 
+export interface LyricWord {
+  text: string;
+  start: number;
+  end: number;
+}
+
 export interface LyricLine {
   time: number;
   text: string;
   translation?: string;
   roma?: string;
+  words?: LyricWord[];
   fallback?: boolean;
 }
 
@@ -560,11 +567,14 @@ export interface PlatformLoginEntry {
   loggedIn: boolean;
   userId?: string | number;
   nickname?: string;
+  avatar?: string;
   avatarUrl?: string;
   vipType?: number;
   cookieValid?: boolean;
   updatedAt?: number;
 }
+
+export type PlatformStatus = PlatformLoginEntry;
 
 export interface LoginStatusMap {
   netease: PlatformLoginEntry;
@@ -587,14 +597,33 @@ export interface UpdateDownloadPage {
   url: string;
 }
 
+export interface UpdateReleaseInfo {
+  tagName?: string;
+  name?: string;
+  version?: string;
+  publishedAt?: string;
+  htmlUrl?: string;
+  externalUrl?: string;
+  downloadPageUrl?: string;
+  downloadPages?: UpdateDownloadPage[];
+  downloadUrl?: string;
+  summary?: string;
+  notes?: string[];
+  [key: string]: unknown;
+}
+
 export interface UpdateCheckResult {
   ok?: boolean;
+  configured?: boolean;
+  preview?: boolean;
+  updateAvailable?: boolean;
   currentVersion?: string;
   latestVersion?: string;
   hasUpdate?: boolean;
   releaseUrl?: string;
-  notes?: string;
+  notes?: string | string[];
   downloadPages?: UpdateDownloadPage[];
+  release?: UpdateReleaseInfo;
   checkedAt?: number;
   error?: string;
 }
@@ -772,25 +801,74 @@ export interface TodayListeningStats {
   date: string;
   totalSeconds: number;
   playCount: number;
-  topArtists?: Array<{ name: string; count: number }>;
+  topArtists?: Array<{ name: string; count: number; seconds?: number }>;
 }
 
-export interface HomeDiscoverData {
+export interface DiscoverHomeData {
+  ok?: boolean;
+  loggedIn?: boolean;
+  dailySongs?: SongRecord[];
   playlists?: PlaylistSummary[];
+  podcasts?: PlaylistSummary[];
   songs?: SongRecord[];
-  podcasts?: SongRecord[];
+  updatedAt?: number;
+  error?: string;
+  [key: string]: unknown;
+}
+
+export type HomeDiscoverData = DiscoverHomeData;
+
+export interface WeatherRadioWeatherInfo {
+  city?: string;
+  temperature?: number;
+  weatherCode?: number;
+  summary?: string;
+  toString?: () => string;
+}
+
+export interface WeatherRadioStationInfo {
+  title?: string;
+  subtitle?: string;
+  seedQueries?: string[];
+  songs?: SongRecord[];
   updatedAt?: number;
 }
 
 export interface WeatherRadioData {
+  ok?: boolean;
+  weather?: WeatherRadioWeatherInfo | string;
+  radio?: WeatherRadioStationInfo;
   city?: string;
-  weather?: string;
   temperature?: string | number;
   greeting?: string;
   tracks?: SongRecord[];
+  [key: string]: unknown;
+}
+
+export interface CacheSettingsDetail {
+  rootPath: string;
+  lyricsPath: string;
+  beatmapsPath: string;
+  wallpaperEnginePath: string;
+  userDataPath: string;
+  restartRequired?: boolean;
+  [key: string]: unknown;
+}
+
+export interface CacheUsageStats {
+  lyricsBytes: number;
+  beatmapsBytes: number;
+  wallpaperEngineBytes: number;
+  userDataBytes: number;
+  totalManagedBytes: number;
+  [key: string]: unknown;
 }
 
 export interface CacheSettings {
+  ok?: boolean;
+  settings?: CacheSettingsDetail;
+  usage?: CacheUsageStats;
+  restartRequired?: boolean;
   cacheRoot?: string;
   effectiveRoot?: string;
   beatmapDiskEnabled?: boolean;
@@ -802,10 +880,24 @@ export interface CacheSettings {
 export interface MemorySnapshot {
   supported: boolean;
   platform?: string;
+  totalBytes?: number;
+  freeBytes?: number;
+  usedBytes?: number;
+  totalMB?: number;
+  freeMB?: number;
+  usedMB?: number;
+  usedPercent?: number;
+  process?: {
+    rssBytes?: number;
+    rssMB?: number;
+    heapMB?: number;
+    privateMB?: number;
+  };
   workingSetBytes?: number;
   privateBytes?: number;
   systemTotalBytes?: number;
   systemUsedPercent?: number;
+  source?: string;
   error?: string;
   [key: string]: unknown;
 }
@@ -834,6 +926,9 @@ export interface WallpaperEngineProject {
   title: string;
   type?: string;
   preview?: string;
+  previewUrl?: string;
+  mediaUrl?: string;
+  workshopId?: string;
   file?: string;
   rootId?: string;
   [key: string]: unknown;
@@ -850,4 +945,155 @@ export interface ShelfItem {
   queueIndex?: number;
   podcastKey?: string;
   itemType?: string;
+}
+
+export interface BackgroundMediaState {
+  type: 'none' | 'image' | 'video';
+  url: string;
+  muted?: boolean;
+  source?: string;
+  projectId?: string;
+}
+
+export interface HotkeyBinding {
+  id: string;
+  action: string;
+  label: string;
+  accelerator: string;
+  enabled: boolean;
+}
+
+export interface FxArchiveSlot {
+  name: string;
+  label?: string;
+  fx: Partial<FxSettings>;
+}
+
+export interface PlayerStoreState {
+  // 播放与队列状态
+  playQueue: SongRecord[];
+  currentIdx: number;
+  currentSong: SongRecord | null;
+  playing: boolean;
+  currentTime: number;
+  duration: number;
+  volume: number;
+  muted: boolean;
+  playMode: PlayMode;
+  quality: QualityPreference;
+  audioError: string | null;
+  automixEnabled: boolean;
+  cuefieldStatus: CuefieldStatus;
+
+  // 歌词状态
+  lyrics: LyricLine[];
+  activeLyricIdx: number;
+  lyricOffsetSec: number;
+  desktopLyricsEnabled: boolean;
+  desktopLyricsLocked: boolean;
+
+  // 搜索与首页
+  searchMode: SearchMode;
+  searchQuery: string;
+  searchResults: SongRecord[];
+  searchLoading: boolean;
+  searchHistory: string[];
+  homeDiscover: DiscoverHomeData | null;
+  weatherRadio: WeatherRadioData | null;
+  todayListeningStats: TodayListeningStats;
+
+  // 歌单与本地曲库
+  userPlaylists: PlaylistSummary[];
+  builtInPlaylists: PlaylistSummary[];
+  localTracks: SongRecord[];
+  activePlaylistTracks: SongRecord[];
+
+  // 登录态与彩蛋门控
+  easterEggUnlocked: boolean;
+  platformLogins: LoginStatusMap;
+
+  // 视觉 FX 参数与预设 / UI 面板
+  fx: FxSettings;
+  activePreset: number;
+  diyMode: boolean;
+  shelfOpen: boolean;
+  fxPanelOpen: boolean;
+  playlistPanelOpen: boolean;
+  splashDone: boolean;
+  updateInfo: UpdateCheckResult | null;
+
+  // 扩展弹窗与交互状态
+  activeBackgroundMedia: BackgroundMediaState | null;
+  trackDetailOpen: boolean;
+  trackDetailSong: SongRecord | null;
+  customLyricModalOpen: boolean;
+  cuefieldFeedbackOpen: boolean;
+  cuefieldLastTransition: Record<string, unknown> | null;
+  gestureEnabled: boolean;
+  gestureStatus: string;
+  gestureHint: string;
+  hotkeyBindings: HotkeyBinding[];
+  fxArchiveSlots: FxArchiveSlot[];
+  controlsHidden: boolean;
+  immersiveMode: boolean;
+  shelfExpandedPlaylistId: string | null;
+  shelfFocusedIndex: number;
+
+  // 核心 Actions
+  initApp: () => Promise<void>;
+  unlockEasterEgg: (password: string) => Promise<EasterEggStatus>;
+  resetEasterEgg: () => Promise<EasterEggStatus>;
+  searchTracks: (query: string, mode?: SearchMode) => Promise<SongRecord[]>;
+  playSong: (songOrIndex: SongRecord | number, queue?: SongRecord[]) => Promise<void>;
+  togglePlay: () => Promise<void>;
+  nextTrack: () => Promise<void>;
+  prevTrack: () => Promise<void>;
+  seekTo: (seconds: number) => void;
+  setVolume: (volume: number) => void;
+  toggleMute: () => void;
+  setPlayMode: (mode: PlayMode) => void;
+  cyclePlayMode: () => void;
+  setQuality: (quality: QualityPreference) => void;
+  setAutomixEnabled: (enabled: boolean) => void;
+  setLyricOffsetSec: (offsetSec: number) => void;
+  toggleDesktopLyrics: (enabled?: boolean) => Promise<void>;
+  importLocalFiles: (files?: FileList | File[]) => Promise<SongRecord[]>;
+  loadLocalLibrary: () => Promise<SongRecord[]>;
+  loadPlaylistTracks: (playlist: PlaylistSummary) => Promise<SongRecord[]>;
+  updateFx: (patch: Partial<FxSettings>) => void;
+  resetFxDefaults: () => void;
+  applyVisualPreset: (presetId: number) => void;
+  setSearchMode: (mode: SearchMode) => void;
+  setSearchQuery: (query: string) => void;
+  setDiyMode: (diy: boolean) => void;
+  setShelfOpen: (open: boolean) => void;
+  setFxPanelOpen: (open: boolean) => void;
+  setPlaylistPanelOpen: (open: boolean) => void;
+  setSplashDone: (done: boolean) => void;
+  checkUpdates: () => Promise<UpdateCheckResult | null>;
+  loadHomeDiscover: () => Promise<DiscoverHomeData | null>;
+  loadWeatherRadio: () => Promise<WeatherRadioData | null>;
+  refreshHomeDiscover: () => Promise<void>;
+  refreshLoginStatuses: () => Promise<void>;
+  refreshAllUserPlaylists: () => Promise<PlaylistSummary[]>;
+  getShelfPlaylists: () => PlaylistSummary[];
+
+  // 扩展 Actions
+  setActiveBackgroundMedia: (media: BackgroundMediaState | null) => void;
+  openTrackDetail: (song?: SongRecord) => void;
+  closeTrackDetail: () => void;
+  setCustomLyricModalOpen: (open: boolean) => void;
+  saveCustomLyricForSong: (songKey: string, lrcText: string) => Promise<void>;
+  submitCuefieldFeedback: (rating: number) => Promise<void>;
+  dismissCuefieldFeedback: () => void;
+  setGestureEnabled: (enabled: boolean) => Promise<void>;
+  addSearchHistory: (kw: string) => void;
+  clearSearchHistory: () => void;
+  updateHotkeyBindings: (bindings: HotkeyBinding[]) => Promise<void>;
+  loadFxArchiveDefaults: () => Promise<void>;
+  applyFxArchiveSlot: (name: string) => void;
+  setControlsHidden: (hidden: boolean) => void;
+  setImmersiveMode: (enabled: boolean) => void;
+  setShelfExpandedPlaylistId: (id: string | null) => void;
+  setShelfFocusedIndex: (idx: number) => void;
 }

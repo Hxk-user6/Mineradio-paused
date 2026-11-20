@@ -1,11 +1,51 @@
 import * as THREE from 'three';
 import { coverProxyUrl, resolveMediaUrl } from '../bridge/tauriBridge';
-import { DEFAULT_FX_SETTINGS, type FxSettings, type LyricLine, type ShelfItem } from '../types/mineradio';
+import {
+  DEFAULT_FX_SETTINGS,
+  type AudioReactiveMetrics,
+  type BeatMapData,
+  type FxSettings,
+  type LyricLine,
+  type ShelfItem,
+  type SongRecord,
+} from '../types/mineradio';
 import { audioEngine } from './audioEngine';
+
+interface ExternalPresetPlugin {
+  INDEX?: number;
+  isActive?: (fx: FxSettings) => boolean;
+  update?: (dt: number, ctx: Record<string, unknown>) => void;
+  clear?: () => void;
+  onPresetChange?: (prev: number, next: number, ctx?: Record<string, unknown>) => void;
+  pointerRipple?: (x: number, z: number, strength?: number) => void;
+  pushProperties?: (force?: boolean) => void;
+}
+
+declare global {
+  interface Window {
+    THREE?: typeof THREE;
+    MineradioSonicTopography?: ExternalPresetPlugin;
+    MineradioSonicWorkshop?: ExternalPresetPlugin;
+    fx?: FxSettings;
+    playing?: boolean;
+    audio?: HTMLAudioElement | null;
+    frequencyData?: Uint8Array;
+    playQueue?: SongRecord[];
+    currentIdx?: number;
+    stageLyrics?: {
+      coverPalette?: { primary: string; secondary: string; highlight: string };
+      palette?: { primary: string; secondary: string; highlight: string };
+    };
+    orbit?: { theta: number; phi: number; radius: number };
+  }
+}
 
 export interface VisualEngineCallbacks {
   onShelfSelect?: (item: ShelfItem, index: number) => void;
   onShelfHover?: (item: ShelfItem | null, index: number) => void;
+  onShelfCenterChange?: (item: ShelfItem | null, index: number) => void;
+  onShelfFocusRequest?: (item: ShelfItem, index: number) => void;
+  onFreeCameraChange?: (active: boolean) => void;
 }
 
 interface ShelfCardSlot {
@@ -520,12 +560,16 @@ export class VisualEngine {
   private rippleCursor = 0;
   private particles: THREE.Points | null = null;
   private bloomParticles: THREE.Points | null = null;
+  private backCoverParticles: THREE.Points | null = null;
   private starRiverParticles: THREE.Points | null = null;
   private uniforms: Record<string, THREE.IUniform> | null = null;
   private starRiverUniforms: Record<string, THREE.IUniform> | null = null;
   private currentGrid = 0;
   private coverPalette = { primary: '#9db8cf', secondary: '#7ec8d8', highlight: '#fff0b8' };
   private currentCoverUrl = '';
+  private playQueueRef: SongRecord[] = [];
+  private currentIdxRef = -1;
+  private particleGroupAlpha = 1;
 
   // 骷髅粒子层 (Preset 6)
   private skullGroup: THREE.Points | null = null;
@@ -534,6 +578,10 @@ export class VisualEngine {
   private skullOpacity = 0;
   private skullWheelZoom = 0;
   private skullWheelZoomTarget = 0;
+
+  // BeatMap 与手势旋转
+  private beatMap: BeatMapData | null = null;
+  private gestureRotation = { x: 0, y: 0 };
 
   // 舞台歌词 CanvasTexture 渲染（低配帧预算控制：每帧最多上传 1 个纹理）
   private lyricsGroup: THREE.Group | null = null;
@@ -546,6 +594,7 @@ export class VisualEngine {
   private lyricCurrentTime = 0;
   private lyricDirty = false;
   private lyricRenderKey = '';
+  private lastLyricUploadAt = 0;
 
   // 3D 歌单架
   private shelfGroup: THREE.Group | null = null;
@@ -555,10 +604,11 @@ export class VisualEngine {
   private shelfVisibilityMix = 0;
   private shelfCenterTarget = 0;
   private shelfCenterSmooth = 0;
+  private shelfLastCenterIdx = -1;
   private shelfHoveredSlot = -1;
   private shelfCoverCache = new Map<string, HTMLImageElement>();
 
-  // 相机轨道与运镜
+  // 相机轨道与自由镜头
   private orbit = {
     userTheta: 0,
     userPhi: 0.08,
@@ -574,6 +624,15 @@ export class VisualEngine {
     hadDrag: false,
     downX: 0,
     downY: 0,
+  };
+  private freeCamera = {
+    active: false,
+    pos: new THREE.Vector3(0, 0, 6.6),
+    yaw: 0,
+    pitch: 0.08,
+    fov: 45,
+    keys: new Set<string>(),
+    resetting: false,
   };
   private raycaster = new THREE.Raycaster();
   private pointerNdc = new THREE.Vector2();
@@ -732,6 +791,22 @@ export class VisualEngine {
     this.bloomParticles.renderOrder = 0;
     this.bloomParticles.visible = Boolean(this.fx.bloom);
     this.scene.add(this.bloomParticles);
+
+    const backMat = new THREE.ShaderMaterial({
+      uniforms: this.uniforms,
+      vertexShader: PARTICLE_VS,
+      fragmentShader: PARTICLE_FS,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.NormalBlending,
+    });
+    this.backCoverParticles = new THREE.Points(geo, backMat);
+    this.backCoverParticles.frustumCulled = false;
+    this.backCoverParticles.renderOrder = 0;
+    this.backCoverParticles.position.set(0, 0, -0.06);
+    this.backCoverParticles.rotation.set(0, Math.PI, 0);
+    this.backCoverParticles.visible = Boolean(this.fx.backCover);
+    this.scene.add(this.backCoverParticles);
   }
 
   private initStarRiver(): void {
@@ -858,12 +933,22 @@ export class VisualEngine {
         const dy = e.clientY - this.orbit.lastY;
         this.orbit.lastX = e.clientX;
         this.orbit.lastY = e.clientY;
-        const dTheta = -dx * 0.0052;
-        const dPhi = dy * 0.0044;
-        this.orbit.userTheta += dTheta;
-        this.orbit.userPhi = clamp(this.orbit.userPhi + dPhi, -Math.PI * 0.45, Math.PI * 0.45);
-        this.orbit.velTheta = dTheta;
-        this.orbit.velPhi = dPhi;
+        if (this.freeCamera.active) {
+          this.freeCamera.yaw -= dx * 0.0028;
+          this.freeCamera.pitch = clamp(
+            this.freeCamera.pitch - dy * 0.0024,
+            -Math.PI * 0.48,
+            Math.PI * 0.48
+          );
+          this.freeCamera.resetting = false;
+        } else {
+          const dTheta = -dx * 0.0052;
+          const dPhi = dy * 0.0044;
+          this.orbit.userTheta += dTheta;
+          this.orbit.userPhi = clamp(this.orbit.userPhi + dPhi, -Math.PI * 0.45, Math.PI * 0.45);
+          this.orbit.velTheta = dTheta;
+          this.orbit.velPhi = dPhi;
+        }
         if (
           Math.hypot(e.clientX - this.orbit.downX, e.clientY - this.orbit.downY) > 6
         ) {
@@ -897,14 +982,30 @@ export class VisualEngine {
     const onMouseUp = () => {
       const wasDrag = this.orbit.hadDrag;
       this.orbit.rotating = false;
-      if (!wasDrag && this.shelfVisible && this.camera) {
+      if (wasDrag) return;
+      if (this.shelfVisible && this.camera) {
         const hit = this.raycastShelf(this.pointerNdc);
         if (hit) {
-          this.shelfCenterTarget = hit.itemIndex;
-          this.callbacks.onShelfSelect?.(hit.item, hit.itemIndex);
-        } else {
-          this.spawnRipple((Math.random() - 0.5) * 1.4, (Math.random() - 0.5) * 1.4, 0.85);
+          const isAlreadyCentered =
+            Math.abs(hit.itemIndex - this.shelfCenterSmooth) < 0.35 &&
+            Math.round(this.shelfCenterTarget) === hit.itemIndex;
+          if (isAlreadyCentered) {
+            this.callbacks.onShelfSelect?.(hit.item, hit.itemIndex);
+          } else {
+            this.shelfCenterTarget = hit.itemIndex;
+            this.callbacks.onShelfFocusRequest?.(hit.item, hit.itemIndex);
+          }
+          return;
         }
+      }
+      if (this.fx.preset === 7 && typeof window !== 'undefined') {
+        window.MineradioSonicTopography?.pointerRipple?.(
+          this.mouseHit.x * 6,
+          this.mouseHit.y * 6,
+          1.25
+        );
+      } else {
+        this.spawnRipple((Math.random() - 0.5) * 1.4, (Math.random() - 0.5) * 1.4, 0.85);
       }
     };
 
@@ -919,6 +1020,11 @@ export class VisualEngine {
 
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
+      if (this.freeCamera.active) {
+        this.freeCamera.fov = clamp(this.freeCamera.fov + e.deltaY * 0.02, 26, 72);
+        this.freeCamera.resetting = false;
+        return;
+      }
       if (this.shelfVisible && this.shelfHoveredSlot >= 0 && this.shelfItems.length > 0) {
         const step = e.deltaY > 0 ? 1 : -1;
         this.shelfCenterTarget = clamp(
@@ -940,12 +1046,63 @@ export class VisualEngine {
     };
 
     const onDblClick = () => {
-      this.recenterCamera();
+      if (this.freeCamera.active) {
+        this.resetFreeCamera();
+      } else {
+        this.recenterCamera();
+      }
+    };
+
+    const isEditableTarget = (target: EventTarget | null): boolean => {
+      const el = target as HTMLElement | null;
+      return Boolean(
+        el &&
+          (el.tagName === 'INPUT' ||
+            el.tagName === 'TEXTAREA' ||
+            el.tagName === 'SELECT' ||
+            el.isContentEditable)
+      );
+    };
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (isEditableTarget(e.target)) return;
+      if (!e.ctrlKey && !e.metaKey && !e.altKey) {
+        if (e.code === 'KeyR') {
+          this.toggleFreeCamera();
+          return;
+        }
+        if (e.code === 'KeyK') {
+          this.resetFreeCamera();
+          return;
+        }
+      }
+      if (this.freeCamera.active) {
+        if (
+          e.code === 'KeyW' ||
+          e.code === 'KeyA' ||
+          e.code === 'KeyS' ||
+          e.code === 'KeyD' ||
+          e.code === 'KeyQ' ||
+          e.code === 'KeyE' ||
+          e.code === 'Space' ||
+          e.code === 'ControlLeft' ||
+          e.code === 'ControlRight'
+        ) {
+          this.freeCamera.keys.add(e.code);
+          this.freeCamera.resetting = false;
+        }
+      }
+    };
+
+    const onKeyUp = (e: KeyboardEvent) => {
+      this.freeCamera.keys.delete(e.code);
     };
 
     dom.addEventListener('mousedown', onMouseDown);
     window.addEventListener('mousemove', onMouseMove);
     window.addEventListener('mouseup', onMouseUp);
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
     dom.addEventListener('mouseleave', onMouseLeave);
     dom.addEventListener('wheel', onWheel, { passive: false });
     dom.addEventListener('dblclick', onDblClick);
@@ -954,6 +1111,8 @@ export class VisualEngine {
       dom.removeEventListener('mousedown', onMouseDown);
       window.removeEventListener('mousemove', onMouseMove);
       window.removeEventListener('mouseup', onMouseUp);
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
       dom.removeEventListener('mouseleave', onMouseLeave);
       dom.removeEventListener('wheel', onWheel);
       dom.removeEventListener('dblclick', onDblClick);
@@ -997,6 +1156,96 @@ export class VisualEngine {
 
   // ==================== 公共命令式接口 ====================
 
+  private syncPresetGlobals(): void {
+    if (typeof window === 'undefined') return;
+    window.THREE = THREE;
+    window.fx = this.fx;
+    window.playing = this.playing;
+    window.audio = audioEngine.getActiveAudioElement();
+    window.frequencyData = audioEngine.getFrequencyData();
+    window.playQueue = this.playQueueRef;
+    window.currentIdx = this.currentIdxRef;
+    window.stageLyrics = {
+      coverPalette: this.coverPalette,
+      palette: this.coverPalette,
+    };
+    window.orbit = {
+      theta: this.orbit.theta,
+      phi: this.orbit.phi,
+      radius: this.orbit.radius,
+    };
+  }
+
+  public setCurrentSongContext(
+    song: SongRecord | null,
+    queue?: SongRecord[],
+    currentIdx?: number
+  ): void {
+    if (Array.isArray(queue)) {
+      this.playQueueRef = queue;
+    } else if (song && this.playQueueRef.length === 0) {
+      this.playQueueRef = [song];
+    }
+    if (typeof currentIdx === 'number') {
+      this.currentIdxRef = currentIdx;
+    } else if (song && this.playQueueRef.length > 0) {
+      const idx = this.playQueueRef.indexOf(song);
+      this.currentIdxRef = idx >= 0 ? idx : 0;
+    }
+    this.syncPresetGlobals();
+  }
+
+  public setBeatMap(map: BeatMapData | null): void {
+    this.beatMap = map || null;
+  }
+
+  public isFreeCameraActive(): boolean {
+    return this.freeCamera.active;
+  }
+
+  public toggleFreeCamera(force?: boolean): boolean {
+    const next = typeof force === 'boolean' ? force : !this.freeCamera.active;
+    if (next === this.freeCamera.active) return next;
+    this.freeCamera.active = next;
+    this.freeCamera.resetting = false;
+    this.freeCamera.keys.clear();
+    if (next && this.camera) {
+      this.freeCamera.pos.copy(this.camera.position);
+      const dir = new THREE.Vector3(0, 0, 0).sub(this.camera.position).normalize();
+      this.freeCamera.yaw = Math.atan2(-dir.x, -dir.z);
+      this.freeCamera.pitch = Math.asin(clamp(dir.y, -0.99, 0.99));
+      this.freeCamera.fov = this.camera.fov || 45;
+    } else if (!next && this.camera && this.camera.fov !== 45) {
+      this.camera.fov = 45;
+      this.camera.updateProjectionMatrix();
+    }
+    this.callbacks.onFreeCameraChange?.(next);
+    return next;
+  }
+
+  public resetFreeCamera(): void {
+    if (this.freeCamera.active) {
+      this.freeCamera.resetting = true;
+    } else {
+      this.recenterCamera();
+    }
+  }
+
+  public applyGestureRotation(rx: number, ry: number): void {
+    this.gestureRotation.x += Number(rx) || 0;
+    this.gestureRotation.y += Number(ry) || 0;
+  }
+
+  public resetGestureRotation(): void {
+    this.gestureRotation.x = 0;
+    this.gestureRotation.y = 0;
+  }
+
+  public setShelfCenter(index: number): void {
+    if (!this.shelfItems.length) return;
+    this.shelfCenterTarget = clamp(Math.round(index), 0, this.shelfItems.length - 1);
+  }
+
   public setCallbacks(callbacks: VisualEngineCallbacks): void {
     this.callbacks = { ...this.callbacks, ...callbacks };
   }
@@ -1004,12 +1253,15 @@ export class VisualEngine {
   public syncFx(nextFx: FxSettings): void {
     const prevPreset = this.fx.preset;
     this.fx = { ...this.fx, ...nextFx };
-    if (prevPreset !== this.fx.preset) {
+    const nextPreset = Number(this.fx.preset) || 0;
+    if (prevPreset !== nextPreset) {
       this.burstAmt = 1.0;
     }
 
+    this.syncPresetGlobals();
+
     if (this.uniforms) {
-      this.uniforms.uPreset.value = Number(this.fx.preset) || 0;
+      this.uniforms.uPreset.value = nextPreset;
       this.uniforms.uIntensity.value = clamp(this.fx.intensity, 0, 2);
       this.uniforms.uDepth.value = clamp(this.fx.depth, 0, 2);
       this.uniforms.uPointScale.value = clamp(this.fx.point, 0.3, 3);
@@ -1033,7 +1285,14 @@ export class VisualEngine {
     }
 
     if (this.bloomParticles) {
-      this.bloomParticles.visible = Boolean(this.fx.bloom);
+      this.bloomParticles.visible = Boolean(this.fx.bloom) && nextPreset !== 8;
+    }
+    if (this.backCoverParticles) {
+      this.backCoverParticles.visible =
+        Boolean(this.fx.backCover) &&
+        nextPreset !== 3 &&
+        nextPreset !== SKULL_PRESET_INDEX &&
+        nextPreset !== 8;
     }
 
     const nextGrid = coverParticleGridForResolution(this.fx.coverResolution);
@@ -1042,6 +1301,9 @@ export class VisualEngine {
       const newGeo = buildCoverParticleGeometry(nextGrid);
       this.particles.geometry = newGeo;
       this.bloomParticles.geometry = newGeo;
+      if (this.backCoverParticles) {
+        this.backCoverParticles.geometry = newGeo;
+      }
       this.currentGrid = nextGrid;
       oldGeo.dispose();
     }
@@ -1054,8 +1316,14 @@ export class VisualEngine {
       if (this.uniforms) this.uniforms.uPixel.value = pr;
     }
 
-    if (this.fx.preset === SKULL_PRESET_INDEX && !this.skullAssetData && !this.skullAssetLoading) {
+    if (nextPreset === SKULL_PRESET_INDEX && !this.skullAssetData && !this.skullAssetLoading) {
       this.loadSkullAsset().catch(() => {});
+    }
+
+    if (prevPreset !== nextPreset && typeof window !== 'undefined') {
+      const ctx = { fx: this.fx, scene: this.scene, camera: this.camera };
+      window.MineradioSonicTopography?.onPresetChange?.(prevPreset, nextPreset, ctx);
+      window.MineradioSonicWorkshop?.onPresetChange?.(prevPreset, nextPreset, ctx);
     }
 
     this.lyricDirty = true;
@@ -1208,7 +1476,24 @@ export class VisualEngine {
     this.activeLyricIdx = activeIdx;
     this.lyricCurrentTime = currentTime;
     const activeLine = this.lyricLines[activeIdx];
-    const nextKey = `${activeIdx}|${activeLine?.text || ''}|${activeLine?.translation || ''}|${this.fx.lyricDisplayMode}|${this.fx.lyricColor}|${this.fx.lyricHighlightColor}|${this.fx.lyricFont}`;
+    const progressBucket = this.playing ? Math.floor(currentTime * 24) : 0;
+    const glitchBucket =
+      this.fx.lyricMotionStyle === 'glitch' && this.playing ? Math.floor(currentTime * 15) : 0;
+    const nextKey = [
+      activeIdx,
+      activeLine?.text || '',
+      activeLine?.translation || '',
+      activeLine?.roma || '',
+      this.fx.lyricDisplayMode,
+      this.fx.lyricTranslationMode,
+      this.fx.lyricColor,
+      this.fx.lyricHighlightColor,
+      this.fx.lyricFont,
+      this.fx.lyricTextureClarity,
+      this.fx.lyricMotionStyle,
+      progressBucket,
+      glitchBucket,
+    ].join('|');
     if (nextKey !== this.lyricRenderKey) {
       this.lyricRenderKey = nextKey;
       this.lyricDirty = true;
@@ -1307,8 +1592,60 @@ export class VisualEngine {
 
   // ==================== 舞台歌词渲染（帧预算控制） ====================
 
+  private computeActiveLyricProgress(active: LyricLine, nextLine: LyricLine | null): number {
+    if (Array.isArray(active.words) && active.words.length > 0) {
+      const t = this.lyricCurrentTime;
+      const totalChars = active.words.reduce((acc, w) => acc + Math.max(1, w.text.length), 0);
+      if (totalChars <= 0) return 1;
+      let doneChars = 0;
+      for (const word of active.words) {
+        const wLen = Math.max(1, word.text.length);
+        if (t >= word.end) {
+          doneChars += wLen;
+        } else if (t > word.start && word.end > word.start) {
+          doneChars += wLen * clamp((t - word.start) / (word.end - word.start), 0, 1);
+          break;
+        } else {
+          break;
+        }
+      }
+      return clamp(doneChars / totalChars, 0, 1);
+    }
+    const endTime = nextLine?.time != null && nextLine.time > active.time ? nextLine.time : active.time + 3.6;
+    const span = Math.max(0.4, endTime - active.time);
+    return clamp((this.lyricCurrentTime - active.time) / span, 0, 1);
+  }
+
+  private resolveLyricFontFamily(fontKey: string | undefined): string {
+    switch (String(fontKey || 'sans').toLowerCase()) {
+      case 'song':
+      case 'serif':
+        return '"Noto Serif SC", "Songti SC", serif';
+      case 'hei':
+        return '"PingFang SC", "Microsoft YaHei", "Noto Sans SC", sans-serif';
+      case 'mono':
+        return '"JetBrains Mono", monospace';
+      case 'cinzel':
+        return '"Cinzel Decorative", "Noto Serif SC", serif';
+      case 'fraktur':
+        return '"UnifrakturCook", "Cinzel Decorative", serif';
+      default:
+        return 'Inter, "Noto Sans SC", sans-serif';
+    }
+  }
+
   private renderStageLyricsTexture(): void {
     if (!this.lyricCtx || !this.lyricCanvas || !this.lyricTexture || !this.lyricMesh) return;
+
+    const clarity = clamp(Number(this.fx.lyricTextureClarity ?? 1), 0.75, 2.0);
+    const targetW = Math.round(1408 * clarity);
+    const targetH = Math.round(480 * clarity);
+    if (this.lyricCanvas.width !== targetW || this.lyricCanvas.height !== targetH) {
+      this.lyricCanvas.width = targetW;
+      this.lyricCanvas.height = targetH;
+      this.lyricTexture.needsUpdate = true;
+    }
+
     const ctx = this.lyricCtx;
     const w = this.lyricCanvas.width;
     const h = this.lyricCanvas.height;
@@ -1347,47 +1684,123 @@ export class VisualEngine {
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     const weight = clamp(Number(this.fx.lyricWeight) || 750, 400, 900);
-    const fontFamily =
-      this.fx.lyricFont === 'song'
-        ? '"Noto Serif SC", serif'
-        : this.fx.lyricFont === 'mono'
-        ? '"JetBrains Mono", monospace'
-        : 'Inter, "Noto Sans SC", sans-serif';
+    const fontFamily = this.resolveLyricFontFamily(this.fx.lyricFont);
+    const s = clarity;
 
     if (prevLine?.text) {
       ctx.save();
       ctx.globalAlpha = clamp(this.fx.lyricContextOpacity, 0.1, 0.9);
-      ctx.font = `${weight} 34px ${fontFamily}`;
+      ctx.font = `${weight} ${Math.round(34 * s)}px ${fontFamily}`;
       ctx.fillStyle = subColor;
-      ctx.fillText(prevLine.text, w / 2, h * 0.22, w * 0.88);
+      ctx.fillText(prevLine.text, w / 2, h * 0.2, w * 0.88);
       ctx.restore();
     }
 
+    // 主歌词逐字/逐句高亮裁切绘制 + Glitch 效果
+    const mainFontSize = Math.round(60 * s);
+    const mainY = h * 0.44;
+    const maxMainW = w * 0.92;
+    const progress = this.computeActiveLyricProgress(active, nextLine);
+    const isGlitch = this.fx.lyricMotionStyle === 'glitch';
+    const glitchIntensity = isGlitch ? clamp(this.fx.lyricGlitchIntensity ?? 1, 0, 2) : 0;
+    const glitchJitter =
+      isGlitch && glitchIntensity > 0
+        ? Math.sin(this.elapsedSec * 42 * (this.fx.lyricGlitchRate || 1)) *
+          6 *
+          s *
+          clamp(this.fx.lyricGlitchJitter ?? 0.72, 0, 2) *
+          glitchIntensity
+        : 0;
+    const chromaShift =
+      isGlitch && glitchIntensity > 0
+        ? 4.5 * s * clamp(this.fx.lyricGlitchChroma ?? 0.86, 0, 2) * glitchIntensity
+        : 0;
+
+    ctx.save();
+    ctx.font = `${weight} ${mainFontSize}px ${fontFamily}`;
+    const measuredW = Math.min(maxMainW, ctx.measureText(active.text).width);
+    const textLeft = w / 2 - measuredW / 2;
+
+    if (chromaShift > 0.2) {
+      ctx.save();
+      ctx.globalAlpha = 0.42;
+      ctx.fillStyle = '#00f5d4';
+      ctx.fillText(active.text, w / 2 - chromaShift + glitchJitter, mainY, maxMainW);
+      ctx.fillStyle = '#ff4d94';
+      ctx.fillText(active.text, w / 2 + chromaShift - glitchJitter * 0.6, mainY, maxMainW);
+      ctx.restore();
+    }
+
+    // 未唱底色层
+    ctx.save();
+    ctx.globalAlpha = 0.46;
+    ctx.fillStyle = subColor;
+    ctx.fillText(active.text, w / 2 + glitchJitter * 0.3, mainY, maxMainW);
+    ctx.restore();
+
+    // 已唱高亮裁切层
     ctx.save();
     if (this.fx.lyricGlow) {
       ctx.shadowColor = this.fx.lyricGlowLinked ? mainColor : this.fx.lyricGlowColor || '#9db8cf';
-      ctx.shadowBlur = 18 * clamp(this.fx.lyricGlowStrength, 0, 2);
+      ctx.shadowBlur = 18 * s * clamp(this.fx.lyricGlowStrength, 0, 2);
     }
-    ctx.font = `${weight} 62px ${fontFamily}`;
+    const clipWidth = Math.max(0, measuredW * progress);
+    ctx.beginPath();
+    ctx.rect(textLeft - 8 * s, 0, clipWidth + 16 * s, h);
+    ctx.clip();
     ctx.fillStyle = mainColor;
-    ctx.fillText(active.text, w / 2, h * 0.48, w * 0.92);
+    ctx.fillText(active.text, w / 2 + glitchJitter * 0.3, mainY, maxMainW);
     ctx.restore();
 
-    if (active.translation && this.fx.lyricTranslationMode !== 'off') {
+    // Glitch 水平切片位移微闪
+    if (isGlitch && glitchIntensity > 0.2 && clamp(this.fx.lyricGlitchSlice ?? 0.72, 0, 2) > 0.1) {
+      const sliceOffset =
+        Math.cos(this.elapsedSec * 57 * (this.fx.lyricGlitchRate || 1)) *
+        8 *
+        s *
+        clamp(this.fx.lyricGlitchSlice ?? 0.72, 0, 2);
       ctx.save();
-      ctx.globalAlpha = clamp(this.fx.lyricTranslationOpacity, 0.1, 1);
-      ctx.font = `${Math.max(400, weight - 150)} 32px ${fontFamily}`;
-      ctx.fillStyle = subColor;
-      ctx.fillText(active.translation, w / 2, h * 0.68, w * 0.88);
+      ctx.beginPath();
+      ctx.rect(0, mainY - 8 * s, w, 14 * s);
+      ctx.clip();
+      ctx.globalAlpha = 0.55;
+      ctx.fillStyle = mainColor;
+      ctx.fillText(active.text, w / 2 + sliceOffset, mainY, maxMainW);
       ctx.restore();
+    }
+    ctx.restore();
+
+    // 副行翻译 / 音译渲染
+    const transMode = String(this.fx.lyricTranslationMode || 'multi');
+    if (transMode !== 'off') {
+      const subLines: string[] = [];
+      if ((transMode === 'translation' || transMode === 'multi') && active.translation) {
+        subLines.push(active.translation);
+      }
+      if ((transMode === 'roma' || transMode === 'multi') && active.roma) {
+        subLines.push(active.roma);
+      }
+      if (subLines.length > 0) {
+        const transScale = clamp(this.fx.lyricTranslationScale ?? 0.65, 0.4, 1.1);
+        const transSize = Math.round(48 * transScale * s);
+        const transGap = clamp(this.fx.lyricTranslationGap ?? 0.92, 0.4, 2) * 34 * s;
+        ctx.save();
+        ctx.globalAlpha = clamp(this.fx.lyricTranslationOpacity ?? 0.86, 0.1, 1);
+        ctx.font = `${Math.max(400, weight - 150)} ${transSize}px ${fontFamily}`;
+        ctx.fillStyle = subColor;
+        subLines.slice(0, 2).forEach((lineText, idx) => {
+          ctx.fillText(lineText, w / 2, h * 0.63 + idx * transGap, w * 0.88);
+        });
+        ctx.restore();
+      }
     }
 
     if (nextLine?.text) {
       ctx.save();
       ctx.globalAlpha = clamp(this.fx.lyricContextOpacity, 0.1, 0.9);
-      ctx.font = `${weight} 34px ${fontFamily}`;
+      ctx.font = `${weight} ${Math.round(34 * s)}px ${fontFamily}`;
       ctx.fillStyle = subColor;
-      ctx.fillText(nextLine.text, w / 2, h * 0.86, w * 0.88);
+      ctx.fillText(nextLine.text, w / 2, h * 0.88, w * 0.88);
       ctx.restore();
     }
 
@@ -1484,6 +1897,10 @@ export class VisualEngine {
     this.shelfCenterSmooth += (this.shelfCenterTarget - this.shelfCenterSmooth) * Math.min(1, dt * 10);
 
     const centerIdx = Math.round(this.shelfCenterSmooth);
+    if (centerIdx !== this.shelfLastCenterIdx) {
+      this.shelfLastCenterIdx = centerIdx;
+      this.callbacks.onShelfCenterChange?.(this.shelfItems[centerIdx] || null, centerIdx);
+    }
     const startIdx = Math.max(0, centerIdx - SHELF_VISIBLE_RADIUS);
     const shelfScale = clamp(this.fx.shelfSize ?? 0.92, 0.4, 2);
     this.shelfGroup.position.set(
@@ -1538,9 +1955,86 @@ export class VisualEngine {
     this.rafId = requestAnimationFrame(tick);
   }
 
+  private computeBeatMapPulse(currentTime: number): number {
+    if (!this.beatMap) return 0;
+    const beats =
+      (this.beatMap.cameraBeats && this.beatMap.cameraBeats.length > 0
+        ? this.beatMap.cameraBeats
+        : this.beatMap.kicks && this.beatMap.kicks.length > 0
+        ? this.beatMap.kicks
+        : this.beatMap.beats) || [];
+    if (!beats.length) return 0;
+
+    let lo = 0;
+    let hi = beats.length - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (beats[mid] <= currentTime) lo = mid + 1;
+      else hi = mid - 1;
+    }
+    const prevBeat = hi >= 0 ? beats[hi] : -999;
+    const dtSince = currentTime - prevBeat;
+    if (dtSince >= 0 && dtSince <= 0.16) {
+      return clamp(1 - dtSince / 0.16, 0, 1);
+    }
+    return 0;
+  }
+
+  private updateFreeCamera(dt: number): void {
+    if (!this.camera) return;
+    const fc = this.freeCamera;
+    if (fc.resetting) {
+      const lerpAlpha = Math.min(1, dt * 6);
+      fc.pos.lerp(new THREE.Vector3(0, 0, 6.6), lerpAlpha);
+      fc.yaw += (0 - fc.yaw) * lerpAlpha;
+      fc.pitch += (0.08 - fc.pitch) * lerpAlpha;
+      fc.fov += (45 - fc.fov) * lerpAlpha;
+      if (
+        fc.pos.distanceTo(new THREE.Vector3(0, 0, 6.6)) < 0.02 &&
+        Math.abs(fc.yaw) < 0.01 &&
+        Math.abs(fc.pitch - 0.08) < 0.01
+      ) {
+        fc.pos.set(0, 0, 6.6);
+        fc.yaw = 0;
+        fc.pitch = 0.08;
+        fc.fov = 45;
+        fc.resetting = false;
+      }
+    } else {
+      const moveSpeed = 4.2 * dt;
+      const forward = new THREE.Vector3(
+        -Math.sin(fc.yaw) * Math.cos(fc.pitch),
+        Math.sin(fc.pitch),
+        -Math.cos(fc.yaw) * Math.cos(fc.pitch)
+      ).normalize();
+      const right = new THREE.Vector3().crossVectors(forward, new THREE.Vector3(0, 1, 0)).normalize();
+      if (fc.keys.has('KeyW')) fc.pos.addScaledVector(forward, moveSpeed);
+      if (fc.keys.has('KeyS')) fc.pos.addScaledVector(forward, -moveSpeed);
+      if (fc.keys.has('KeyD')) fc.pos.addScaledVector(right, moveSpeed);
+      if (fc.keys.has('KeyA')) fc.pos.addScaledVector(right, -moveSpeed);
+      if (fc.keys.has('Space')) fc.pos.y += moveSpeed;
+      if (fc.keys.has('ControlLeft') || fc.keys.has('ControlRight')) fc.pos.y -= moveSpeed;
+      if (fc.keys.has('KeyQ')) fc.yaw += 1.4 * dt;
+      if (fc.keys.has('KeyE')) fc.yaw -= 1.4 * dt;
+    }
+
+    if (Math.abs(this.camera.fov - fc.fov) > 0.05) {
+      this.camera.fov = fc.fov;
+      this.camera.updateProjectionMatrix();
+    }
+    this.camera.position.copy(fc.pos);
+    const lookTarget = new THREE.Vector3(
+      fc.pos.x - Math.sin(fc.yaw) * Math.cos(fc.pitch),
+      fc.pos.y + Math.sin(fc.pitch),
+      fc.pos.z - Math.cos(fc.yaw) * Math.cos(fc.pitch)
+    );
+    this.camera.lookAt(lookTarget);
+  }
+
   private stepFrame(dt: number): void {
     if (!this.renderer || !this.scene || !this.camera || !this.uniforms) return;
-    const metrics = audioEngine.getAudioReactiveMetrics();
+    const metrics: AudioReactiveMetrics = audioEngine.getAudioReactiveMetrics();
+    this.syncPresetGlobals();
 
     this.elapsedSec += dt;
     this.uniforms.uTime.value = this.elapsedSec;
@@ -1549,6 +2043,33 @@ export class VisualEngine {
     this.uniforms.uTreble.value = metrics.treble;
     this.uniforms.uEnergy.value = metrics.energy;
     this.uniforms.uBeat.value = metrics.beatPulse;
+
+    // Preset 8 时优雅淡出主粒子让 #sonic-workshop-layer 显现
+    const targetParticleAlpha = this.fx.preset === 8 ? 0 : 1;
+    this.particleGroupAlpha += (targetParticleAlpha - this.particleGroupAlpha) * Math.min(1, dt * 6);
+    this.uniforms.uAlpha.value = this.particleGroupAlpha;
+    if (this.particles) {
+      this.particles.visible = this.particleGroupAlpha > 0.01 && this.fx.preset !== 3;
+      this.particles.rotation.set(this.gestureRotation.x, this.gestureRotation.y, 0);
+    }
+    if (this.bloomParticles) {
+      this.bloomParticles.visible =
+        Boolean(this.fx.bloom) && this.particleGroupAlpha > 0.01 && this.fx.preset !== 8;
+      this.bloomParticles.rotation.set(this.gestureRotation.x, this.gestureRotation.y, 0);
+    }
+    if (this.backCoverParticles) {
+      this.backCoverParticles.visible =
+        Boolean(this.fx.backCover) &&
+        this.particleGroupAlpha > 0.01 &&
+        this.fx.preset !== 3 &&
+        this.fx.preset !== SKULL_PRESET_INDEX &&
+        this.fx.preset !== 8;
+      this.backCoverParticles.rotation.set(
+        this.gestureRotation.x,
+        this.gestureRotation.y + Math.PI,
+        0
+      );
+    }
 
     if (this.colorMixT < 1) {
       this.colorMixT = Math.min(1, this.colorMixT + dt * 1.4);
@@ -1586,7 +2107,7 @@ export class VisualEngine {
     this.uniforms.uRippleCount.value = activeRipples;
     if (this.rippleTex) this.rippleTex.needsUpdate = true;
 
-    // 自由轨道惯性与电影运镜
+    // 自由轨道惯性与电影/BeatMap 运镜
     if (!this.orbit.rotating) {
       this.orbit.userTheta += this.orbit.velTheta;
       this.orbit.userPhi = clamp(this.orbit.userPhi + this.orbit.velPhi, -Math.PI * 0.45, Math.PI * 0.45);
@@ -1598,18 +2119,30 @@ export class VisualEngine {
     this.orbit.radius += (this.orbit.userRadius - this.orbit.radius) * Math.min(1, dt * 8);
 
     const shake = this.fx.cinema ? clamp(this.fx.cinemaShake ?? 0.5, 0, 1.8) : 0;
-    const cineTheta = Math.sin(this.elapsedSec * 0.14) * 0.055 * shake;
+    const beatMapPulse = this.playing ? this.computeBeatMapPulse(metrics.currentTime) : 0;
+    const pulseAmt = Math.max(metrics.beatPulse, beatMapPulse * 0.85);
+    const cineTheta = Math.sin(this.elapsedSec * 0.14) * 0.055 * shake + beatMapPulse * 0.014 * shake * Math.sin(this.elapsedSec * 2.4);
     const cinePhi = Math.cos(this.elapsedSec * 0.11) * 0.032 * shake;
-    const cineRad = -metrics.beatPulse * 0.14 * shake;
+    const cineRad = -pulseAmt * 0.16 * shake;
 
-    if (this.fx.preset === SKULL_PRESET_INDEX && this.skullGroup) {
+    if (this.freeCamera.active) {
+      if (this.skullGroup && this.fx.preset !== SKULL_PRESET_INDEX) {
+        this.skullGroup.visible = false;
+      }
+      this.updateFreeCamera(dt);
+    } else if (this.fx.preset === SKULL_PRESET_INDEX && this.skullGroup) {
       this.skullOpacity += (1 - this.skullOpacity) * Math.min(1, dt * 3.2);
       this.skullWheelZoom += (this.skullWheelZoomTarget - this.skullWheelZoom) * Math.min(1, dt * 8);
       this.skullGroup.visible = true;
+      this.skullGroup.rotation.set(
+        -0.26 + this.gestureRotation.x * 0.65,
+        this.gestureRotation.y * 0.65,
+        0
+      );
       const su = (this.skullGroup.material as THREE.ShaderMaterial).uniforms;
       su.uOpacity.value = this.skullOpacity;
-      su.uSkullFlash.value = metrics.beatPulse;
-      su.uJawOpen.value = clamp(0.6 + metrics.bass * 0.09 + metrics.beatPulse * 0.1, 0.52, 0.88);
+      su.uSkullFlash.value = pulseAmt;
+      su.uJawOpen.value = clamp(0.6 + metrics.bass * 0.09 + pulseAmt * 0.1, 0.52, 0.88);
       this.camera.position.set(0, -2.5, 4.98 + this.skullWheelZoom);
       this.camera.lookAt(0, -0.2, 0.02);
     } else {
@@ -1627,6 +2160,33 @@ export class VisualEngine {
         totalRad * Math.cos(totalPhi) * Math.cos(totalTheta)
       );
       this.camera.lookAt(0, 0, 0);
+    }
+
+    // Preset 7 & Preset 8 外部插件更新
+    if (typeof window !== 'undefined') {
+      const audioFrame = {
+        bass: metrics.bass,
+        mid: metrics.mid,
+        treble: metrics.treble,
+        energy: metrics.energy,
+        beat: pulseAmt,
+        kickEnvelope: metrics.kickLevel,
+        subBass: clamp(metrics.bass * 0.8 + pulseAmt * 0.2, 0, 1),
+        lowMid: clamp(metrics.mid * 0.7 + metrics.bass * 0.3, 0, 1),
+        highMid: clamp(metrics.mid * 0.5 + metrics.treble * 0.5, 0, 1),
+        presence: metrics.treble,
+        brilliance: metrics.treble,
+        air: clamp(metrics.treble * 0.8, 0, 1),
+      };
+      const pluginCtx = {
+        fx: this.fx,
+        scene: this.scene,
+        camera: this.camera,
+        audio: audioFrame,
+        time: this.elapsedSec,
+      };
+      window.MineradioSonicTopography?.update?.(dt, pluginCtx);
+      window.MineradioSonicWorkshop?.update?.(dt, pluginCtx);
     }
 
     // 舞台歌词位置与低配帧预算控制（每帧最多上传 1 个 CanvasTexture）
@@ -1647,18 +2207,23 @@ export class VisualEngine {
         0
       );
       if (this.lyricDirty) {
-        let uploaded = 0;
-        if (uploaded < MAX_NEW_LYRIC_TEXTURES_PER_FRAME) {
-          this.renderStageLyricsTexture();
-          this.lyricDirty = false;
-          uploaded++;
+        const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
+        if (nowMs - this.lastLyricUploadAt >= 16) {
+          let uploaded = 0;
+          if (uploaded < MAX_NEW_LYRIC_TEXTURES_PER_FRAME) {
+            this.renderStageLyricsTexture();
+            this.lyricDirty = false;
+            this.lastLyricUploadAt = nowMs;
+            uploaded++;
+          }
         }
       }
     }
 
     // 星河背景显隐
     if (this.starRiverParticles && this.starRiverUniforms) {
-      const showStar = this.fx.backgroundStarRiver !== false && this.fx.preset !== 5;
+      const showStar =
+        this.fx.backgroundStarRiver !== false && this.fx.preset !== 5 && this.fx.preset !== 8;
       this.starRiverParticles.visible = showStar;
       this.starRiverUniforms.uAlpha.value = showStar ? 0.34 : 0;
     }
@@ -1698,6 +2263,11 @@ export class VisualEngine {
     this.particles?.geometry.dispose();
     (this.particles?.material as THREE.Material | undefined)?.dispose();
     (this.bloomParticles?.material as THREE.Material | undefined)?.dispose();
+    (this.backCoverParticles?.material as THREE.Material | undefined)?.dispose();
+    if (typeof window !== 'undefined') {
+      window.MineradioSonicTopography?.clear?.();
+      window.MineradioSonicWorkshop?.clear?.();
+    }
     this.starRiverParticles?.geometry.dispose();
     (this.starRiverParticles?.material as THREE.Material | undefined)?.dispose();
     this.skullGroup?.geometry.dispose();
@@ -1725,6 +2295,7 @@ export class VisualEngine {
     this.renderer = null;
     this.particles = null;
     this.bloomParticles = null;
+    this.backCoverParticles = null;
     this.starRiverParticles = null;
     this.skullGroup = null;
     this.lyricsGroup = null;

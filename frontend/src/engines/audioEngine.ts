@@ -41,6 +41,9 @@ interface DeckGraph {
   echoDelayNode: DelayNode | null;
   echoFeedbackNode: GainNode | null;
   echoWetNode: GainNode | null;
+  loopTimer: ReturnType<typeof setInterval> | null;
+  loopStartedWallMs: number;
+  loopStartAt: number;
 }
 
 export interface CuefieldPendingTransition {
@@ -70,7 +73,12 @@ export interface AudioEngineCallbacks {
   onEnded?: () => void;
   onError?: (message: string) => void;
   onCuefieldStatus?: (status: CuefieldStatus) => void;
-  onCuefieldHandoff?: (nextSong: SongRecord, nextIndex: number) => void;
+  onCuefieldHandoff?: (
+    nextSong: SongRecord,
+    nextIndex: number,
+    transitionMeta?: Record<string, unknown>
+  ) => void;
+  onBeatMapReady?: (songKey: string, map: BeatMapData) => void;
   getNextTrackContext?: () => {
     currentSong: SongRecord | null;
     currentIndex: number;
@@ -590,6 +598,9 @@ export class AudioEngine {
       echoDelayNode: null,
       echoFeedbackNode: null,
       echoWetNode: null,
+      loopTimer: null,
+      loopStartedWallMs: 0,
+      loopStartAt: 0,
     };
   }
 
@@ -782,7 +793,17 @@ export class AudioEngine {
     }
   }
 
+  private clearDeckLoop(deck: DeckGraph): void {
+    if (deck.loopTimer) {
+      clearInterval(deck.loopTimer);
+      deck.loopTimer = null;
+    }
+    deck.loopStartedWallMs = 0;
+    deck.loopStartAt = 0;
+  }
+
   private resetDeckProcessing(deck: DeckGraph): void {
+    this.clearDeckLoop(deck);
     const now = this.ctx?.currentTime || 0;
     if (deck.filterNode) {
       deck.filterNode.type = 'highpass';
@@ -813,22 +834,38 @@ export class AudioEngine {
       return '';
     }
 
+    const hintParams = new URLSearchParams();
+    const songName = String(song.name || song.title || '').trim();
+    const songArtist = String(song.artist || '').trim();
+    const songAlbum =
+      typeof song.album === 'string'
+        ? song.album.trim()
+        : String((song.album as { name?: string } | undefined)?.name || '').trim();
+    const songDuration = Number(song.duration || 0);
+    if (songName) hintParams.set('name', songName);
+    if (songArtist) hintParams.set('artist', songArtist);
+    if (songAlbum) hintParams.set('album', songAlbum);
+    if (Number.isFinite(songDuration) && songDuration > 0) {
+      hintParams.set('duration', String(songDuration));
+    }
+    const hintSuffix = hintParams.toString() ? `&${hintParams.toString()}` : '';
+
     let endpoint = '';
     if (provider === 'qq') {
       const mid = encodeURIComponent(String(song.mid || song.songmid || song.id || ''));
       const mediaMid = encodeURIComponent(String(song.mediaMid || song.media_mid || ''));
-      endpoint = `/api/qq/song/url?mid=${mid}&mediaMid=${mediaMid}&quality=${encodeURIComponent(quality)}`;
+      endpoint = `/api/qq/song/url?mid=${mid}&mediaMid=${mediaMid}&quality=${encodeURIComponent(quality)}${hintSuffix}`;
     } else if (provider === 'kugou') {
       const hash = encodeURIComponent(
         String(song.hash || song.fileHash || song.audioHash || song.id || '')
       );
-      endpoint = `/api/kugou/song/url?hash=${hash}&quality=${encodeURIComponent(quality)}`;
+      endpoint = `/api/kugou/song/url?hash=${hash}&quality=${encodeURIComponent(quality)}${hintSuffix}`;
     } else if (provider === 'qishui') {
       const id = encodeURIComponent(String(song.id || song.providerSongId || ''));
-      endpoint = `/api/qishui/song/url?id=${id}&quality=${encodeURIComponent(quality)}`;
+      endpoint = `/api/qishui/song/url?id=${id}&quality=${encodeURIComponent(quality)}${hintSuffix}`;
     } else {
       const id = encodeURIComponent(String(song.id || ''));
-      endpoint = `/api/song/url?id=${id}&level=${encodeURIComponent(quality)}`;
+      endpoint = `/api/song/url?id=${id}&level=${encodeURIComponent(quality)}${hintSuffix}`;
     }
 
     const res = await apiJson<{ url?: string; error?: string }>(endpoint, { timeoutMs: 14000 });
@@ -968,6 +1005,8 @@ export class AudioEngine {
       const timer = this.timelineTimers.pop();
       if (timer) clearTimeout(timer);
     }
+    this.clearDeckLoop(this.decks.A);
+    this.clearDeckLoop(this.decks.B);
   }
 
   private scheduleCuefieldPrepare(delayMs = 1500): void {
@@ -1219,7 +1258,105 @@ export class AudioEngine {
         deck.audio.playbackRate = clamp(action.value, 0.94, 1.06);
         break;
       }
+      case 'duck': {
+        const bpm = clamp(action.bpm ?? 120, 40, 240);
+        const depth = clamp(action.depth ?? 0.35, 0.08, 0.75);
+        const pulses = Math.round(clamp(action.pulses ?? 4, 1, 16));
+        const beats = clamp(action.beats ?? 1, 0.25, 4);
+        const intervalSec = (60 / bpm) * beats;
+        const attackSec = clamp((action.attack ?? 24) / 1000, 0.005, 0.12);
+        const holdSec = clamp((action.hold ?? 70) / 1000, 0.01, 0.18);
+        const releaseSec = clamp((action.release ?? 180) / 1000, 0.04, 0.32);
+
+        if (deck.gainNode && this.ctx) {
+          const g = deck.gainNode.gain;
+          const baseGain = Math.max(0.05, g.value || this.effectiveVolume());
+          const duckedGain = baseGain * (1 - depth);
+          for (let i = 0; i < pulses; i++) {
+            const t0 = now + i * intervalSec;
+            g.setValueAtTime(baseGain, t0);
+            g.linearRampToValueAtTime(duckedGain, t0 + attackSec);
+            g.setValueAtTime(duckedGain, t0 + attackSec + holdSec);
+            g.linearRampToValueAtTime(baseGain, t0 + attackSec + holdSec + releaseSec);
+          }
+        } else {
+          const baseVol = this.effectiveVolume();
+          const duckedVol = baseVol * (1 - depth);
+          for (let i = 0; i < pulses; i++) {
+            const delayStart = Math.round(i * intervalSec * 1000);
+            const delayBack = Math.round((i * intervalSec + attackSec + holdSec) * 1000);
+            const t1 = setTimeout(() => {
+              this.applyDeckGain(deck, duckedVol);
+            }, delayStart);
+            const t2 = setTimeout(() => {
+              this.applyDeckGain(deck, baseVol);
+            }, delayBack);
+            this.timelineTimers.push(t1, t2);
+          }
+        }
+        break;
+      }
+      case 'loop': {
+        if (action.enabled === false) {
+          const startedAt = deck.loopStartedWallMs;
+          const baseStart = deck.loopStartAt;
+          this.clearDeckLoop(deck);
+          if (action.slip !== false && startedAt > 0) {
+            const elapsedSec = (Date.now() - startedAt) / 1000;
+            const dur = Number.isFinite(deck.audio.duration) ? deck.audio.duration : Infinity;
+            deck.audio.currentTime = clamp(baseStart + elapsedSec, 0, dur);
+          }
+        } else {
+          this.clearDeckLoop(deck);
+          const startAt = Math.max(0, action.startAt ?? action.at ?? deck.audio.currentTime ?? 0);
+          const loopSec = Math.max(0.25, action.loopSeconds ?? ((60 / (action.bpm || 120)) * (action.loopBeats || 1)));
+          const endAt = startAt + loopSec;
+          deck.loopStartedWallMs = Date.now();
+          deck.loopStartAt = startAt;
+          deck.loopTimer = setInterval(() => {
+            const cur = Number(deck.audio.currentTime) || 0;
+            if (cur >= endAt) {
+              deck.audio.currentTime = startAt;
+            }
+          }, 25);
+        }
+        break;
+      }
+      case 'bridge': {
+        const tpl = action.bridge?.template || 'drum-build';
+        const totalDurSec = Math.max(0.4, durSec || 4);
+        if (deck.filterNode && this.ctx) {
+          deck.filterNode.type = tpl === 'impact-drop' ? 'lowpass' : 'highpass';
+          const startFreq = tpl === 'impact-drop' ? 12000 : 120;
+          const peakFreq = tpl === 'impact-drop' ? 420 : 1400;
+          deck.filterNode.frequency.setValueAtTime(startFreq, now);
+          deck.filterNode.frequency.linearRampToValueAtTime(peakFreq, now + totalDurSec * 0.85);
+          deck.filterNode.frequency.linearRampToValueAtTime(
+            tpl === 'impact-drop' ? 18000 : 20,
+            now + totalDurSec
+          );
+        }
+        if ((tpl === 'echo-break' || tpl === 'loop-rise') && deck.echoSendNode && deck.echoWetNode && deck.echoDelayNode && deck.echoFeedbackNode && this.ctx) {
+          const bpm = action.bridge?.bpmFrom || 120;
+          deck.echoDelayNode.delayTime.setValueAtTime(clamp(60 / bpm / 2, 0.05, 1.5), now);
+          deck.echoFeedbackNode.gain.setTargetAtTime(0.42, now, 0.03);
+          deck.echoSendNode.gain.setTargetAtTime(1, now, 0.03);
+          deck.echoWetNode.gain.setValueAtTime(0.05, now);
+          deck.echoWetNode.gain.linearRampToValueAtTime(0.35, now + totalDurSec * 0.8);
+          deck.echoWetNode.gain.linearRampToValueAtTime(0, now + totalDurSec);
+        } else if (!deck.filterNode && Array.isArray(action.fallbackTimeline) && action.fallbackTimeline.length) {
+          for (const fb of action.fallbackTimeline) {
+            const norm = normalizeCuefieldAction(fb, 0, this.effectiveVolume(), null, 1, false);
+            const t = setTimeout(() => {
+              this.applyNormalizedAction(deck, norm, inDeck, pending);
+            }, norm.delayMs);
+            this.timelineTimers.push(t);
+          }
+        }
+        break;
+      }
       case 'stop': {
+        this.clearDeckLoop(deck);
         deck.audio.pause?.();
         break;
       }
@@ -1253,7 +1390,15 @@ export class AudioEngine {
       // ignore
     }
 
-    this.callbacks.onCuefieldHandoff?.(pending.nextSong, pending.nextIndex);
+    this.callbacks.onCuefieldHandoff?.(pending.nextSong, pending.nextIndex, {
+      fromKey: pending.fromKey,
+      toKey: pending.toKey,
+      executionMode: pending.executionMode,
+      recipe: pending.executionMode,
+      artifactId: pending.plan?.chosen?.artifactId,
+      score: pending.plan?.chosen?.score ?? pending.plan?.chosen?.evaluation?.score,
+      timestamp: Date.now(),
+    });
     this.setCuefieldStatus('waiting');
     this.scheduleCuefieldPrepare(2200);
   }
@@ -1268,18 +1413,27 @@ export class AudioEngine {
   public async ensureBeatMap(song: SongRecord, resolvedUrl?: string): Promise<BeatMapData | null> {
     const key = songIdentityKey(song);
     if (!key) return null;
-    if (this.beatMapCache.has(key)) return this.beatMapCache.get(key)!;
+    if (this.beatMapCache.has(key)) {
+      const cached = this.beatMapCache.get(key)!;
+      this.callbacks.onBeatMapReady?.(key, cached);
+      return cached;
+    }
     if (this.beatAnalysisInFlight.has(key)) return this.beatAnalysisInFlight.get(key)!;
 
     const task = (async (): Promise<BeatMapData | null> => {
       try {
-        const remote = await apiJson<{ ok?: boolean; beatMap?: BeatMapData; data?: BeatMapData }>(
-          `/api/beatmap/cache?key=${encodeURIComponent(key)}`,
-          { timeoutMs: 3500 }
-        ).catch(() => null);
-        const remoteMap = remote?.beatMap || remote?.data;
+        const remote = await apiJson<{
+          ok?: boolean;
+          map?: BeatMapData;
+          beatMap?: BeatMapData;
+          data?: BeatMapData;
+        }>(`/api/beatmap/cache?key=${encodeURIComponent(key)}`, { timeoutMs: 3500 }).catch(
+          () => null
+        );
+        const remoteMap = remote?.map || remote?.beatMap || remote?.data;
         if (remoteMap && Array.isArray(remoteMap.beats) && remoteMap.beats.length > 0) {
           this.beatMapCache.set(key, remoteMap);
+          this.callbacks.onBeatMapReady?.(key, remoteMap);
           return remoteMap;
         }
 
@@ -1301,12 +1455,21 @@ export class AudioEngine {
 
         const map = this.computeBeatMapFromBuffer(buffer, key);
         this.beatMapCache.set(key, map);
+        this.callbacks.onBeatMapReady?.(key, map);
 
         // 异步上报 /api/beatmap/cache
         apiJson('/api/beatmap/cache', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ key, beatMap: map, song }),
+          body: JSON.stringify({
+            key,
+            map,
+            meta: {
+              provider: String(song.provider || song.source || 'netease'),
+              title: String(song.name || song.title || ''),
+              artist: String(song.artist || ''),
+            },
+          }),
           timeoutMs: 4000,
         }).catch(() => {});
 
@@ -1407,6 +1570,14 @@ export class AudioEngine {
   }
 
   // ==================== 零开销实时音频指标 ====================
+
+  public getFrequencyData(): Uint8Array {
+    return this.freqData;
+  }
+
+  public getActiveAudioElement(): HTMLAudioElement | null {
+    return this.activeDeck?.audio || null;
+  }
 
   public getAudioReactiveMetrics(): AudioReactiveMetrics {
     const deck = this.activeDeck;

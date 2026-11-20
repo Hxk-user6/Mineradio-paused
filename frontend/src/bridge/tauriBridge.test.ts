@@ -68,6 +68,15 @@ describe('tauriBridge', () => {
     expect(resolveMediaUrl('mineradio-wallpaper://localhost/scene-9')).toBe(
       'http://127.0.0.1:3000/we-media/scene-9'
     );
+    expect(resolveMediaUrl('/assets/skull-decimation-points.bin')).toBe(
+      '/assets/skull-decimation-points.bin'
+    );
+    expect(
+      resolveMediaUrl('/assets/skull-decimation-points.bin', { preferHttpFallback: true })
+    ).toBe('/assets/skull-decimation-points.bin');
+    expect(resolveMediaUrl('mineradio-wallpaper://media/42?path=bg.mp4&cap=abc')).toBe(
+      'http://127.0.0.1:3000/we-media/file/42?path=bg.mp4&cap=abc'
+    );
   });
 
   it('Mock __TAURI_INTERNALS__.invoke 时能路由 get_runtime_endpoints、媒体令牌与桌面命令', async () => {
@@ -123,8 +132,16 @@ describe('tauriBridge', () => {
     expect(resolveMediaUrl('mineradio-local://audio/abc', { preferHttpFallback: true })).toBe(
       'http://127.0.0.1:45678/local-media/audio/abc?cap=tok-999'
     );
+    expect(
+      resolveMediaUrl('mineradio-wallpaper://media/99?path=scene.mp4', {
+        preferHttpFallback: true,
+      })
+    ).toBe('http://127.0.0.1:45678/we-media/file/99?path=scene.mp4&cap=tok-999');
     // Tauri 下默认保留自定义协议
     expect(resolveMediaUrl('mineradio-local://audio/abc')).toBe('mineradio-local://audio/abc');
+    expect(resolveMediaUrl('/assets/skull-decimation-points.bin')).toBe(
+      '/assets/skull-decimation-points.bin'
+    );
 
     expect(audioProxyUrl('https://cdn.example.com/a.flac')).toBe(
       'http://127.0.0.1:45678/api/audio?url=https%3A%2F%2Fcdn.example.com%2Fa.flac'
@@ -150,6 +167,38 @@ describe('tauriBridge', () => {
 
     const lrcRes = await desktopWindow.setDesktopLyricsEnabled(true, { line: 'Hello' });
     expect(lrcRes).toEqual({ ok: true, enabled: true });
+
+    await desktopWindow.desktopLyricsGetState();
+    expect(invokeSpy).toHaveBeenCalledWith('desktop_lyrics_get_state', undefined);
+
+    await desktopWindow.openNeteaseMusicLogin(true);
+    expect(invokeSpy).toHaveBeenCalledWith('open_netease_music_login', { forceReauth: true });
+
+    await desktopWindow.openQQMusicLogin();
+    expect(invokeSpy).toHaveBeenCalledWith('open_qq_music_login', { forceReauth: false });
+
+    await desktopWindow.openKugouMusicLogin();
+    expect(invokeSpy).toHaveBeenCalledWith('open_kugou_music_login', { forceReauth: false });
+
+    await desktopWindow.openQishuiAuthLogin();
+    expect(invokeSpy).toHaveBeenCalledWith('open_qishui_auth_login', { forceReauth: false });
+
+    await desktopWindow.clearPlatformLoginSession('netease');
+    expect(invokeSpy).toHaveBeenCalledWith('clear_platform_login_session', { provider: 'netease' });
+
+    await desktopWindow.closePlatformLoginWindow();
+    expect(invokeSpy).toHaveBeenCalledWith('close_platform_login_window', undefined);
+  });
+
+  it('onPlatformLoginSuccess 能正确监听平台登录成功事件', async () => {
+    const received: Array<{ provider: string; loggedIn: boolean }> = [];
+    const unlisten = desktopWindow.onPlatformLoginSuccess((payload) => {
+      received.push({ provider: payload.provider, loggedIn: payload.loggedIn });
+    });
+    await new Promise((r) => setTimeout(r, 0));
+    emitLocalEvent('mineradio-platform-login-success', { provider: 'qq', loggedIn: true });
+    expect(received).toEqual([{ provider: 'qq', loggedIn: true }]);
+    unlisten();
   });
 
   it('apiFetch 会将相对路径拼接至当前 runtime httpBase', async () => {

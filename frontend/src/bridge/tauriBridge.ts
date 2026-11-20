@@ -104,6 +104,21 @@ async function safeInvoke<T>(
   return await fallback();
 }
 
+async function safeInvokeGraceful<T>(
+  cmd: string,
+  args: Record<string, unknown> | undefined,
+  fallback: (err?: unknown) => T | Promise<T>
+): Promise<T> {
+  if (isTauriRuntime()) {
+    try {
+      return await invokeCommand<T>(cmd, args);
+    } catch (err) {
+      return await fallback(err);
+    }
+  }
+  return await fallback();
+}
+
 export async function getRuntimeEndpoints(forceRefresh = false): Promise<RuntimeEndpoints> {
   const tauri = isTauriRuntime();
   if (!forceRefresh && cachedEndpoints && cachedForTauri === tauri) {
@@ -171,6 +186,7 @@ export function resolveMediaUrl(
   const raw = String(url || '').trim();
   if (!raw) return '';
   if (/^(data:|blob:)/i.test(raw)) return raw;
+  if (raw.startsWith('/assets/')) return raw;
 
   const httpBase = getCachedHttpBase();
   const mediaToken = getCachedMediaToken();
@@ -192,7 +208,10 @@ export function resolveMediaUrl(
     const stripped = raw
       .replace(/^mineradio-wallpaper:\/\/(?:localhost\/)?/i, '')
       .replace(/^\/+/, '');
-    const httpUrl = `${httpBase}/we-media/${stripped}`;
+    const normalizedPath = stripped.startsWith('media/')
+      ? `file/${stripped.slice('media/'.length)}`
+      : stripped;
+    const httpUrl = `${httpBase}/we-media/${normalizedPath}`;
     return mediaToken && !/[?&]cap=/.test(httpUrl)
       ? appendQueryParam(httpUrl, 'cap', mediaToken)
       : httpUrl;
@@ -501,6 +520,12 @@ export interface DesktopWindowBridge {
   configureMemoryReduct: (payload?: Record<string, unknown>) => Promise<{ ok: boolean; supported?: boolean }>;
 
   // 桌面歌词
+  desktopLyricsGetState: () => Promise<{
+    ok: boolean;
+    enabled?: boolean;
+    locked?: boolean;
+    payload?: DesktopLyricsPayload | null;
+  }>;
   setDesktopLyricsEnabled: (
     enabled: boolean,
     payload?: DesktopLyricsPayload
@@ -510,6 +535,25 @@ export interface DesktopWindowBridge {
   moveDesktopLyricsBy: (dx: number, dy: number) => Promise<{ ok: boolean }>;
   onDesktopLyricsLockState: (callback: (payload: { locked: boolean }) => void) => UnlistenFn;
   onDesktopLyricsEnabledState: (callback: (payload: { enabled: boolean }) => void) => UnlistenFn;
+
+  // 平台授权登录弹窗控制
+  openNeteaseMusicLogin: (
+    forceReauth?: boolean
+  ) => Promise<{ ok: boolean; url?: string; error?: string }>;
+  openQQMusicLogin: (
+    forceReauth?: boolean
+  ) => Promise<{ ok: boolean; url?: string; error?: string }>;
+  openKugouMusicLogin: (
+    forceReauth?: boolean
+  ) => Promise<{ ok: boolean; url?: string; error?: string }>;
+  openQishuiAuthLogin: (
+    forceReauth?: boolean
+  ) => Promise<{ ok: boolean; url?: string; error?: string }>;
+  clearPlatformLoginSession: (provider: string) => Promise<{ ok: boolean }>;
+  closePlatformLoginWindow: () => Promise<{ ok: boolean }>;
+  onPlatformLoginSuccess: (
+    callback: (payload: { provider: string; loggedIn: boolean; status?: unknown }) => void
+  ) => UnlistenFn;
 
   // 外部打开 / 剪贴板 / 导入导出 JSON
   openUpdatePage: (url: string) => Promise<{ ok: boolean; error?: string }>;
@@ -862,11 +906,18 @@ export const desktopWindow: DesktopWindowBridge = {
   },
 
   // ==================== 缓存 / FX 自动保存 / 歌词缓存 ====================
-  getCacheSettings: () =>
-    safeInvoke<CacheSettings>('get_cache_settings', undefined, () => ({
+  getCacheSettings: async () => {
+    const raw = await safeInvoke<CacheSettings>('get_cache_settings', undefined, () => ({
       beatmapDiskEnabled: false,
       lyricCacheEnabled: true,
-    })),
+    }));
+    const rootPath = raw.settings?.rootPath || raw.cacheRoot || '';
+    return {
+      ...raw,
+      cacheRoot: raw.cacheRoot || rootPath,
+      effectiveRoot: raw.effectiveRoot || rootPath,
+    };
+  },
   setCacheSettings: (payload: Partial<CacheSettings>) =>
     safeInvoke<CacheSettings>('set_cache_settings', { payload }, () => payload),
   chooseCacheDirectory: () =>
@@ -891,11 +942,26 @@ export const desktopWindow: DesktopWindowBridge = {
     })),
 
   // ==================== 内存快照与清理 ====================
-  getMemorySnapshot: () =>
-    safeInvoke<MemorySnapshot>('get_memory_snapshot', undefined, () => ({
+  getMemorySnapshot: async () => {
+    const raw = await safeInvoke<MemorySnapshot>('get_memory_snapshot', undefined, () => ({
       supported: false,
       platform: typeof navigator !== 'undefined' ? navigator.platform : 'browser',
-    })),
+    }));
+    return {
+      ...raw,
+      workingSetBytes:
+        raw.workingSetBytes ??
+        raw.process?.rssBytes ??
+        (raw.process?.rssMB != null ? Math.round(raw.process.rssMB * 1024 * 1024) : undefined),
+      privateBytes:
+        raw.privateBytes ??
+        (raw.process?.privateMB != null
+          ? Math.round(raw.process.privateMB * 1024 * 1024)
+          : undefined),
+      systemTotalBytes: raw.systemTotalBytes ?? raw.totalBytes,
+      systemUsedPercent: raw.systemUsedPercent ?? raw.usedPercent,
+    };
+  },
   trimAppMemory: (payload) =>
     safeInvoke('trim_app_memory', { payload: payload || {} }, () => ({
       ok: true,
@@ -913,6 +979,18 @@ export const desktopWindow: DesktopWindowBridge = {
     })),
 
   // ==================== 桌面歌词 ====================
+  desktopLyricsGetState: () =>
+    safeInvokeGraceful<{
+      ok: boolean;
+      enabled?: boolean;
+      locked?: boolean;
+      payload?: DesktopLyricsPayload | null;
+    }>('desktop_lyrics_get_state', undefined, () => ({
+      ok: false,
+      enabled: false,
+      locked: false,
+      payload: null,
+    })),
   setDesktopLyricsEnabled: (enabled: boolean, payload?: DesktopLyricsPayload) =>
     safeInvoke('set_desktop_lyrics_enabled', { enabled: Boolean(enabled), payload: payload || {} }, () => {
       emitLocalEvent('mineradio-desktop-lyrics-enabled-state', { enabled: Boolean(enabled) });
@@ -936,6 +1014,59 @@ export const desktopWindow: DesktopWindowBridge = {
     subscribeWrapper<{ locked: boolean }>('mineradio-desktop-lyrics-lock-state', callback),
   onDesktopLyricsEnabledState: (callback) =>
     subscribeWrapper<{ enabled: boolean }>('mineradio-desktop-lyrics-enabled-state', callback),
+
+  // ==================== 平台授权登录弹窗控制 ====================
+  openNeteaseMusicLogin: (forceReauth = false) =>
+    safeInvokeGraceful<{ ok: boolean; url?: string; error?: string }>(
+      'open_netease_music_login',
+      { forceReauth: Boolean(forceReauth) },
+      (err) => ({
+        ok: false,
+        error: err instanceof Error ? err.message : 'TAURI_REQUIRED',
+      })
+    ),
+  openQQMusicLogin: (forceReauth = false) =>
+    safeInvokeGraceful<{ ok: boolean; url?: string; error?: string }>(
+      'open_qq_music_login',
+      { forceReauth: Boolean(forceReauth) },
+      (err) => ({
+        ok: false,
+        error: err instanceof Error ? err.message : 'TAURI_REQUIRED',
+      })
+    ),
+  openKugouMusicLogin: (forceReauth = false) =>
+    safeInvokeGraceful<{ ok: boolean; url?: string; error?: string }>(
+      'open_kugou_music_login',
+      { forceReauth: Boolean(forceReauth) },
+      (err) => ({
+        ok: false,
+        error: err instanceof Error ? err.message : 'TAURI_REQUIRED',
+      })
+    ),
+  openQishuiAuthLogin: (forceReauth = false) =>
+    safeInvokeGraceful<{ ok: boolean; url?: string; error?: string }>(
+      'open_qishui_auth_login',
+      { forceReauth: Boolean(forceReauth) },
+      (err) => ({
+        ok: false,
+        error: err instanceof Error ? err.message : 'TAURI_REQUIRED',
+      })
+    ),
+  clearPlatformLoginSession: (provider: string) =>
+    safeInvokeGraceful<{ ok: boolean }>(
+      'clear_platform_login_session',
+      { provider: String(provider || '') },
+      () => ({ ok: false })
+    ),
+  closePlatformLoginWindow: () =>
+    safeInvokeGraceful<{ ok: boolean }>('close_platform_login_window', undefined, () => ({
+      ok: true,
+    })),
+  onPlatformLoginSuccess: (callback) =>
+    subscribeWrapper<{ provider: string; loggedIn: boolean; status?: unknown }>(
+      'mineradio-platform-login-success',
+      callback
+    ),
 
   // ==================== 外部链接 / 剪贴板 / JSON 导入导出 ====================
   openUpdatePage: (url: string) =>

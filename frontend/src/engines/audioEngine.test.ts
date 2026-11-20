@@ -1,11 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  AudioEngine,
   buildCuefieldTimelineExecution,
   buildEqualPowerCurve,
   isExecutableCuefieldPlan,
   songIdentityKey,
 } from './audioEngine';
+import { GestureEngine } from './gestureEngine';
+import { VisualEngine } from './visualEngine';
 import {
+  applyFxCssVariables,
   computeNextTrackIndex,
   computePrevTrackIndex,
   parseLrcText,
@@ -268,5 +272,171 @@ describe('playerStore 队列与 FX 状态控制', () => {
 
     store.toggleMute();
     expect(usePlayerStore.getState().muted).toBe(false);
+  });
+});
+
+describe('新增 Engine 与 Store 契约补完验证', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('audioEngine.resolveSongPlaybackUrl 请求附带 name/artist/album/duration MatchHints 参数', async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({ url: 'https://cdn.example.com/hit.mp3' }), { status: 200 })
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const engine = new AudioEngine();
+    await engine.resolveSongPlaybackUrl(
+      {
+        id: '9001',
+        name: '晴天',
+        artist: '周杰伦',
+        album: '叶惠美',
+        duration: 269,
+        provider: 'netease',
+      },
+      'lossless'
+    );
+
+    const [calledUrl] = fetchMock.mock.calls[0] as unknown as [string];
+    expect(calledUrl).toContain('/api/song/url?id=9001&level=lossless');
+    expect(calledUrl).toContain('name=%E6%99%B4%E5%A4%A9');
+    expect(calledUrl).toContain('artist=%E5%91%A8%E6%9D%B0%E4%BC%A6');
+    expect(calledUrl).toContain('album=%E5%8F%B6%E6%83%A0%E7%BE%8E');
+    expect(calledUrl).toContain('duration=269');
+    engine.dispose();
+  });
+
+  it('audioEngine.ensureBeatMap 命中远程 map 并触发 onBeatMapReady 回调', async () => {
+    const sampleMap = {
+      bpm: 120,
+      gridStep: 0.5,
+      duration: 180,
+      beats: [0.5, 1.0, 1.5, 2.0],
+    };
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        new Response(JSON.stringify({ ok: true, hit: true, map: sampleMap }), { status: 200 })
+      )
+    );
+
+    const engine = new AudioEngine();
+    const readySpy = vi.fn();
+    engine.setCallbacks({ onBeatMapReady: readySpy });
+
+    const res = await engine.ensureBeatMap({
+      id: 777,
+      name: 'Beat Track',
+      provider: 'netease',
+    });
+
+    expect(res).toEqual(sampleMap);
+    expect(readySpy).toHaveBeenCalledWith('netease:777', sampleMap);
+    engine.dispose();
+  });
+
+  it('gestureEngine 在无摄像头媒体设备环境下安全报错退出而不崩溃', async () => {
+    const ge = new GestureEngine();
+    const onError = vi.fn();
+    const onStatus = vi.fn();
+    ge.setCallbacks({ onError, onStatusChange: onStatus });
+
+    const ok = await ge.start();
+    expect(ok).toBe(false);
+    expect(ge.isActive()).toBe(false);
+    expect(onError).toHaveBeenCalledWith('MEDIA_DEVICES_UNAVAILABLE');
+    ge.stop();
+  });
+
+  it('visualEngine 支持自由镜头切换与 BeatMap 注入', () => {
+    const ve = new VisualEngine();
+    const camChanges: boolean[] = [];
+    ve.setCallbacks({ onFreeCameraChange: (active) => camChanges.push(active) });
+    expect(ve.isFreeCameraActive()).toBe(false);
+    expect(ve.toggleFreeCamera()).toBe(true);
+    expect(ve.isFreeCameraActive()).toBe(true);
+    expect(ve.toggleFreeCamera(false)).toBe(false);
+    expect(camChanges).toEqual([true, false]);
+
+    ve.setBeatMap({ bpm: 128, gridStep: 0.46875, duration: 180, beats: [0.5, 1.0] });
+    ve.dispose();
+  });
+
+  it('playerStore 多平台歌单合并、发现页/天气电台归一化与歌单架滤波正确工作', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/api/discover/home')) {
+          return new Response(
+            JSON.stringify({
+              loggedIn: true,
+              dailySongs: [{ id: 'd1', name: 'Daily Song', provider: 'netease' }],
+              playlists: [{ id: 'p1', name: 'Daily PL', trackCount: 10, provider: 'netease' }],
+              podcasts: [],
+            }),
+            { status: 200 }
+          );
+        }
+        if (url.includes('/api/weather/radio')) {
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              weather: { city: '上海', temperature: 22, weatherCode: 0, summary: '晴朗' },
+              radio: {
+                title: '晴朗电台',
+                subtitle: '微风正好',
+                songs: [{ id: 'w1', name: 'Weather Song', provider: 'netease' }],
+              },
+            }),
+            { status: 200 }
+          );
+        }
+        if (url.includes('/api/user/playlists')) {
+          return new Response(
+            JSON.stringify({
+              playlists: [
+                { id: '1', name: '我的歌单', trackCount: 5, provider: 'netease', subscribed: false },
+                { id: '2', name: '收藏歌单', trackCount: 8, provider: 'netease', subscribed: true },
+              ],
+            }),
+            { status: 200 }
+          );
+        }
+        if (url.includes('/api/qq/user/playlists')) {
+          return new Response(
+            JSON.stringify({
+              playlists: [{ id: 'q1', name: 'QQ歌单', trackCount: 3, provider: 'qq' }],
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response(JSON.stringify({ playlists: [] }), { status: 200 });
+      })
+    );
+
+    const store = usePlayerStore.getState();
+    const discover = await store.loadHomeDiscover();
+    expect(discover?.songs?.[0]?.name).toBe('Daily Song');
+
+    const weather = await store.loadWeatherRadio();
+    expect(weather?.city).toBe('上海');
+    expect(weather?.tracks?.[0]?.name).toBe('Weather Song');
+    expect(`${weather?.weather}`).toBe('晴朗');
+
+    const playlists = await store.refreshAllUserPlaylists();
+    expect(playlists).toHaveLength(3);
+
+    store.updateFx({ shelfMergeCollections: false });
+    expect(store.getShelfPlaylists().some((p) => p.subscribed)).toBe(false);
+
+    store.updateFx({ shelfMergeCollections: true });
+    expect(store.getShelfPlaylists().some((p) => p.subscribed)).toBe(true);
+
+    applyFxCssVariables({ ...DEFAULT_FX_SETTINGS, homeAccentColor: '#112233', playlistPanelGlassBlur: 24 });
+    expect(document.documentElement.style.getPropertyValue('--home-accent')).toBe('#112233');
+    expect(document.documentElement.style.getPropertyValue('--playlist-panel-glass-blur')).toBe('24px');
   });
 });

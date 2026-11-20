@@ -16,3 +16,10 @@ export {
   visualEngine,
   type VisualEngineCallbacks,
 } from './visualEngine';
+
+export {
+  GestureEngine,
+  gestureEngine,
+  type GestureEngineCallbacks,
+  type GestureSensitivity,
+} from './gestureEngine';
