@@ -1,11 +1,13 @@
 import React, { useEffect, useState } from 'react';
 import { desktopWindow } from '../bridge/tauriBridge';
+import { visualEngine } from '../engines';
 import { usePlayerStore } from '../store/playerStore';
 import {
   DEFAULT_FX_SETTINGS,
   VISUAL_PRESETS,
   type CacheSettings,
   type FxSettings,
+  type HotkeyBinding,
   type MemorySnapshot,
   type WallpaperEngineProject,
 } from '../types/mineradio';
@@ -59,6 +61,22 @@ export function FxConsoleModal({ onToast }: FxConsoleModalProps): React.ReactEle
   const applyVisualPreset = usePlayerStore((s) => s.applyVisualPreset);
   const setShelfOpen = usePlayerStore((s) => s.setShelfOpen);
   const toggleDesktopLyrics = usePlayerStore((s) => s.toggleDesktopLyrics);
+  const setCustomLyricModalOpen = usePlayerStore((s) => s.setCustomLyricModalOpen);
+  const setActiveBackgroundMedia = usePlayerStore((s) => s.setActiveBackgroundMedia);
+  const fxArchiveSlots = usePlayerStore((s) => s.fxArchiveSlots);
+  const applyFxArchiveSlot = usePlayerStore((s) => s.applyFxArchiveSlot);
+  const hotkeyBindings = usePlayerStore((s) => s.hotkeyBindings);
+  const updateHotkeyBindings = usePlayerStore((s) => s.updateHotkeyBindings);
+  const gestureEnabled = usePlayerStore((s) => s.gestureEnabled);
+  const gestureStatus = usePlayerStore((s) => s.gestureStatus);
+  const setGestureEnabled = usePlayerStore((s) => s.setGestureEnabled);
+  const [freeCameraOn, setFreeCameraOn] = useState<boolean>(() => {
+    try {
+      return Boolean(visualEngine.isFreeCameraActive?.());
+    } catch {
+      return false;
+    }
+  });
 
   const [activeTab, setActiveTab] = useState<FxTabKey>('home');
   const [searchTerm, setSearchTerm] = useState('');
@@ -127,8 +145,12 @@ export function FxConsoleModal({ onToast }: FxConsoleModalProps): React.ReactEle
   const handleChooseCacheDir = async () => {
     const res = await desktopWindow.chooseCacheDirectory();
     if (res.ok && res.path) {
-      const updated = await desktopWindow.setCacheSettings({ cacheRoot: res.path });
-      setCacheSettings(updated);
+      const updated = await desktopWindow.setCacheSettings({
+        cacheRoot: res.path,
+        rootPath: res.path,
+      });
+      const fresh = await desktopWindow.getCacheSettings().catch(() => null);
+      setCacheSettings(fresh || updated);
       onToast?.(`缓存目录已切换为：${res.path}`);
     }
   };
@@ -169,6 +191,16 @@ export function FxConsoleModal({ onToast }: FxConsoleModalProps): React.ReactEle
       type: project.type,
     });
     if (res.ok !== false) {
+      const mediaUrl = String(project.mediaUrl || project.previewUrl || '');
+      if (mediaUrl) {
+        setActiveBackgroundMedia({
+          type: /\.(mp4|webm|mov|m4v)(\?|$)/i.test(mediaUrl) ? 'video' : 'image',
+          url: mediaUrl,
+          muted: true,
+          source: 'wallpaper-engine',
+          projectId: project.id,
+        });
+      }
       setActiveWeId(project.id);
       onToast?.(`已启用壁纸场景：${project.title}`);
     } else {
@@ -178,6 +210,7 @@ export function FxConsoleModal({ onToast }: FxConsoleModalProps): React.ReactEle
 
   const handleStopWeProject = async () => {
     await desktopWindow.stopWallpaperEngineScene();
+    setActiveBackgroundMedia(null);
     setActiveWeId('');
     onToast?.('已恢复默认背景');
   };
@@ -208,6 +241,148 @@ export function FxConsoleModal({ onToast }: FxConsoleModalProps): React.ReactEle
   };
 
   const q = searchTerm.trim().toLowerCase();
+  const hit = (label: string) => !q || label.toLowerCase().includes(q);
+
+  const numSlider = (
+    field: keyof FxSettings,
+    label: string,
+    min: number,
+    max: number,
+    step: number,
+    digits = 2
+  ) => {
+    if (!hit(label)) return null;
+    const raw = fx[field];
+    const value = typeof raw === 'number' ? raw : Number(DEFAULT_FX_SETTINGS[field]) || 0;
+    return (
+      <div className="fx-slider" key={String(field)}>
+        <label htmlFor={`fx-${String(field)}`}>{label}</label>
+        <input
+          id={`fx-${String(field)}`}
+          type="range"
+          min={min}
+          max={max}
+          step={step}
+          value={value}
+          onChange={(e) => updateFx({ [field]: Number(e.target.value) } as Partial<FxSettings>)}
+        />
+        <output>{value.toFixed(digits)}</output>
+      </div>
+    );
+  };
+
+  const boolToggle = (field: keyof FxSettings, label: string) => {
+    if (!hit(label)) return null;
+    const active = Boolean(fx[field]);
+    return (
+      <button
+        key={String(field)}
+        type="button"
+        id={`fx-toggle-${String(field)}`}
+        className={`fx-toggle${active ? ' on' : ''}`}
+        onClick={() => updateFx({ [field]: !active } as Partial<FxSettings>)}
+      >
+        <span>{label}</span>
+        <span className="dot" />
+      </button>
+    );
+  };
+
+  const colorRow = (field: keyof FxSettings, label: string, fallback: string) => {
+    if (!hit(label)) return null;
+    const val = String(fx[field] || fallback);
+    return (
+      <div className="lyric-color-row" key={String(field)}>
+        <input
+          id={`fx-${String(field)}`}
+          className="lyric-color-picker"
+          type="color"
+          value={/^#[0-9a-f]{6}$/i.test(val) ? val : fallback}
+          title={label}
+          onChange={(e) => updateFx({ [field]: e.target.value } as Partial<FxSettings>)}
+        />
+        <div className="fx-color-row-label">
+          {label}
+          <small>{val.toUpperCase()}</small>
+        </div>
+      </div>
+    );
+  };
+
+  const segRow = (
+    field: keyof FxSettings,
+    label: string,
+    options: Array<{ key: string; label: string }>
+  ) => {
+    if (!hit(label)) return null;
+    return (
+      <div key={String(field)} style={{ marginTop: 6 }}>
+        <div className="fx-sub">{label}</div>
+        <div className="fx-seg" id={`fx-seg-${String(field)}`}>
+          {options.map((o) => (
+            <button
+              key={o.key}
+              type="button"
+              className={fx[field] === o.key ? 'active' : undefined}
+              onClick={() => updateFx({ [field]: o.key } as Partial<FxSettings>)}
+            >
+              {o.label}
+            </button>
+          ))}
+        </div>
+      </div>
+    );
+  };
+
+  const weQuery = q;
+  const visibleWeProjects = weQuery
+    ? weProjects.filter(
+        (p) =>
+          String(p.title || '').toLowerCase().includes(weQuery) ||
+          String(p.type || '').toLowerCase().includes(weQuery) ||
+          String(p.id || '').toLowerCase().includes(weQuery)
+      )
+    : weProjects;
+
+  const patchHotkey = (id: string, patch: Partial<HotkeyBinding>) => {
+    updateHotkeyBindings(
+      hotkeyBindings.map((b) => (b.id === id ? { ...b, ...patch } : b))
+    ).catch(() => {});
+  };
+
+  const handleToggleFreeCamera = () => {
+    try {
+      setFreeCameraOn(Boolean(visualEngine.toggleFreeCamera()));
+    } catch {
+      setFreeCameraOn((v) => !v);
+    }
+  };
+
+  const handleToggleGesture = () => {
+    setGestureEnabled(!gestureEnabled).catch(() => {});
+  };
+
+  const isPreset7 = activePreset === 7 || fx.preset === 7;
+  const isPreset8 = activePreset === 8 || fx.preset === 8;
+  const cacheDetail = cacheSettings?.settings;
+  const cacheUsage = cacheSettings?.usage;
+  const cacheRootText =
+    cacheDetail?.rootPath || cacheSettings?.effectiveRoot || cacheSettings?.cacheRoot || '默认应用数据目录';
+  const memTotalMB =
+    memorySnapshot?.totalMB ??
+    (memorySnapshot?.totalBytes ?? memorySnapshot?.systemTotalBytes
+      ? (memorySnapshot?.totalBytes ?? memorySnapshot?.systemTotalBytes ?? 0) / 1048576
+      : undefined);
+  const memUsedMB =
+    memorySnapshot?.usedMB ??
+    (memorySnapshot?.usedBytes ? memorySnapshot.usedBytes / 1048576 : undefined);
+  const memUsedPercent = memorySnapshot?.usedPercent ?? memorySnapshot?.systemUsedPercent;
+  const procMB =
+    memorySnapshot?.process?.rssMB ??
+    memorySnapshot?.process?.privateMB ??
+    (memorySnapshot?.workingSetBytes ? memorySnapshot.workingSetBytes / 1048576 : undefined);
+  const fmtMB = (mb?: number) =>
+    mb == null || !Number.isFinite(mb) ? '—' : mb >= 1024 ? `${(mb / 1024).toFixed(2)} GB` : `${mb.toFixed(1)} MB`;
   const filteredPresets = q
     ? VISUAL_PRESETS.filter(
         (p) => p.name.toLowerCase().includes(q) || p.desc.toLowerCase().includes(q)
@@ -388,6 +563,30 @@ export function FxConsoleModal({ onToast }: FxConsoleModalProps): React.ReactEle
                 <span className="dot" />
               </button>
             </div>
+
+            {fxArchiveSlots.length > 0 && (
+              <>
+                <div className="fx-section-label">存档槽位 · 一键套用</div>
+                <div id="fx-archive-slots" style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                  {fxArchiveSlots
+                    .filter((slot) => hit(slot.label || slot.name))
+                    .map((slot) => (
+                      <button
+                        key={slot.name}
+                        type="button"
+                        className="fx-mini-btn ghost"
+                        data-fx-archive-slot={slot.name}
+                        onClick={() => {
+                          applyFxArchiveSlot(slot.name);
+                          onToast?.(`已套用存档：${slot.label || slot.name}`);
+                        }}
+                      >
+                        {slot.label || slot.name}
+                      </button>
+                    ))}
+                </div>
+              </>
+            )}
 
             <div className="fx-section-label">存档与重置</div>
             <div className="fx-actions" style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
@@ -754,6 +953,24 @@ export function FxConsoleModal({ onToast }: FxConsoleModalProps): React.ReactEle
               />
               <output>{fx.lyricWeight}</output>
             </div>
+            {numSlider('lyricTextureClarity', '歌词纹理清晰度', 0.5, 2, 0.05)}
+            <div className="fx-section-label">歌词故障效果</div>
+            {boolToggle('lyricGlitchCameraBind', '故障绑定镜头')}
+            {numSlider('lyricGlitchIntensity', '故障强度', 0, 2, 0.01)}
+            {numSlider('lyricGlitchSlice', '故障切片', 0, 2, 0.01)}
+            {numSlider('lyricGlitchChroma', '故障色散', 0, 2, 0.01)}
+            {numSlider('lyricGlitchRate', '故障频率', 0, 2, 0.01)}
+            {numSlider('lyricGlitchJitter', '故障抖动', 0, 2, 0.01)}
+            <div className="fx-actions" style={{ marginTop: 8 }}>
+              <button
+                id="fx-custom-lyric-btn"
+                type="button"
+                className="fx-mini-btn"
+                onClick={() => setCustomLyricModalOpen(true)}
+              >
+                自定义编辑歌词
+              </button>
+            </div>
             <div className="fx-slider">
               <label>垂直位置</label>
               <input
@@ -818,6 +1035,10 @@ export function FxConsoleModal({ onToast }: FxConsoleModalProps): React.ReactEle
               />
               <output>{fx.desktopLyricsOpacity.toFixed(2)}</output>
             </div>
+            {numSlider('desktopLyricsY', '桌面歌词纵向位置', 0, 1, 0.01)}
+            {boolToggle('desktopLyricsCinema', '桌面歌词沉浸')}
+            {boolToggle('desktopLyricsHighlight', '桌面歌词高亮')}
+            {numSlider('desktopLyricsFps', '桌面歌词帧率', 15, 120, 1, 0)}
           </div>
         )}
 
@@ -941,6 +1162,90 @@ export function FxConsoleModal({ onToast }: FxConsoleModalProps): React.ReactEle
                 onChange={(e) => updateFx({ scatter: Number(e.target.value) })}
               />
               <output>{fx.scatter.toFixed(2)}</output>
+            </div>
+
+            {isPreset7 && (
+              <div id="fx-preset-7-panel">
+                <div className="fx-section-label">Preset 7 · Sonic Ground</div>
+                {numSlider('sonicGroundAmplitude', '地形振幅', 0, 3, 0.01)}
+                {numSlider('sonicGroundMotionSpeed', '地形流速', 0, 3, 0.01)}
+                {numSlider('sonicGroundDensity', '地形密度', 0.2, 3, 0.01)}
+                {numSlider('sonicGroundRange', '地形范围', 0.2, 3, 0.01)}
+                {numSlider('sonicGroundLower', '地形下沉', -2, 2, 0.01)}
+                {numSlider('sonicGroundDepth', '地形纵深', 0, 3, 0.01)}
+                {numSlider('sonicGroundAutoRotate', '自动旋转', 0, 2, 0.01)}
+                {numSlider('sonicGroundGlow', '地形辉光', 0, 3, 0.01)}
+                {segRow('sonicGroundColorMode', '地形配色', [
+                  { key: 'cover', label: '封面' },
+                  { key: 'auto', label: '自动' },
+                  { key: 'custom', label: '自定义' },
+                ])}
+                {colorRow('sonicGroundBaseColor', '底色', '#0b1018')}
+                {colorRow('sonicGroundCoolColor', '冷色', '#4ea3ff')}
+                {colorRow('sonicGroundWarmColor', '暖色', '#ff9a5c')}
+                {colorRow('sonicGroundAccentColor', '强调色', '#ffffff')}
+                <div className="fx-section-label">频段增益</div>
+                {numSlider('sonicGroundSubBass', 'Sub Bass', 0, 3, 0.01)}
+                {numSlider('sonicGroundBass', 'Bass', 0, 3, 0.01)}
+                {numSlider('sonicGroundLowMid', 'Low Mid', 0, 3, 0.01)}
+                {numSlider('sonicGroundMid', 'Mid', 0, 3, 0.01)}
+                {numSlider('sonicGroundHighMid', 'High Mid', 0, 3, 0.01)}
+                {numSlider('sonicGroundPresence', 'Presence', 0, 3, 0.01)}
+                {numSlider('sonicGroundBrilliance', 'Brilliance', 0, 3, 0.01)}
+                {numSlider('sonicGroundAir', 'Air', 0, 3, 0.01)}
+                <div className="fx-section-label">浮游粒子</div>
+                <div className="fx-toggle-grid">{boolToggle('sonicGroundFloatingEnabled', '启用浮游粒子')}</div>
+                {numSlider('sonicGroundFloatingIntensity', '浮游强度', 0, 3, 0.01)}
+                {numSlider('sonicGroundFloatingMinSize', '浮游最小尺寸', 0.1, 4, 0.01)}
+                {numSlider('sonicGroundFloatingMaxSize', '浮游最大尺寸', 0.1, 8, 0.01)}
+                {numSlider('sonicGroundFloatingSpeed', '浮游速度', 0, 3, 0.01)}
+                {numSlider('sonicGroundFloatingCount', '浮游数量', 0, 2000, 10, 0)}
+                <div className="fx-section-label">音频监听</div>
+                <div className="fx-toggle-grid">
+                  {boolToggle('sonicAudioMonitorEnabled', '音频监听')}
+                  {boolToggle('sonicAudioAutoTrack', '自动跟踪')}
+                </div>
+                {numSlider('sonicAudioSensitivity', '监听灵敏度', 0, 3, 0.01)}
+                {numSlider('sonicAudioBandStart', '频段起点', 0, 1, 0.01)}
+                {numSlider('sonicAudioBandEnd', '频段终点', 0, 1, 0.01)}
+                {numSlider('sonicAudioThreshold', '触发阈值', 0, 1, 0.01)}
+                {numSlider('sonicAudioPulseStrength', '脉冲强度', 0, 3, 0.01)}
+              </div>
+            )}
+
+            {isPreset8 && (
+              <div id="fx-preset-8-panel">
+                <div className="fx-section-label">Preset 8 · Sonic Workshop</div>
+                {numSlider('sonicWorkshopInputGain', '输入增益', 0, 4, 0.01)}
+                {numSlider('sonicWorkshopAudioIntensity', '音频强度', 0, 3, 0.01)}
+                {numSlider('sonicWorkshopResponseRange', '响应范围', 0, 3, 0.01)}
+                {numSlider('sonicWorkshopPeakIntensity', '峰值强度', 0, 3, 0.01)}
+                {segRow('sonicWorkshopColorMode', '配色模式', [
+                  { key: 'theme', label: '主题' },
+                  { key: 'cover', label: '封面' },
+                  { key: 'custom', label: '自定义' },
+                ])}
+                {colorRow('sonicWorkshopCustomColor', '自定义主色', '#7ec8d8')}
+                {colorRow('sonicWorkshopBaseColor', '基础色', '#0b1018')}
+                {colorRow('sonicWorkshopWarmColor', '暖色', '#ff9a5c')}
+                {colorRow('sonicWorkshopCoolColor', '冷色', '#4ea3ff')}
+                {colorRow('sonicWorkshopRippleColor', '涟漪色', '#ffffff')}
+                {colorRow('sonicWorkshopPeakColor', '峰值色', '#ffe08a')}
+              </div>
+            )}
+
+            <div className="fx-section-label">视角与封面</div>
+            <div className="fx-toggle-grid">
+              {boolToggle('backCover', '封面背面')}
+              <button
+                id="fx-free-camera-btn"
+                type="button"
+                className={`fx-toggle${freeCameraOn ? ' on' : ''}`}
+                onClick={handleToggleFreeCamera}
+              >
+                <span>自由相机</span>
+                <span className="dot" />
+              </button>
             </div>
 
             <div className="fx-section-label">叠加效果开关</div>
@@ -1145,22 +1450,79 @@ export function FxConsoleModal({ onToast }: FxConsoleModalProps): React.ReactEle
               ))}
             </div>
 
+            <div className="fx-section-label">手势控制</div>
+            <div className="fx-toggle-grid">
+              <button
+                id="fx-gesture-toggle"
+                type="button"
+                className={`fx-toggle${gestureEnabled ? ' on' : ''}`}
+                onClick={handleToggleGesture}
+              >
+                <span>手势控制 · {gestureStatus}</span>
+                <span className="dot" />
+              </button>
+            </div>
+
+            <div className="fx-section-label">全局快捷键</div>
+            <div id="fx-hotkey-panel" style={{ display: 'grid', gap: 6 }}>
+              {hotkeyBindings
+                .filter((b) => hit(b.label) || hit(b.accelerator))
+                .map((b) => (
+                  <div
+                    key={b.id}
+                    className="hotkey-row"
+                    style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}
+                  >
+                    <input
+                      type="checkbox"
+                      aria-label={`启用 ${b.label}`}
+                      checked={b.enabled}
+                      onChange={(e) => patchHotkey(b.id, { enabled: e.target.checked })}
+                    />
+                    <span style={{ flex: 1 }}>{b.label}</span>
+                    <input
+                      type="text"
+                      className="fx-console-search"
+                      style={{ width: 120 }}
+                      aria-label={`${b.label} 快捷键`}
+                      defaultValue={b.accelerator}
+                      onBlur={(e) => {
+                        const v = e.target.value.trim();
+                        if (v && v !== b.accelerator) patchHotkey(b.id, { accelerator: v });
+                      }}
+                    />
+                  </div>
+                ))}
+            </div>
+
             <div className="fx-section-label">内存快照与手动裁剪</div>
             <div className="cache-storage-panel">
               <div className="cache-storage-row">
-                <span>工作集内存</span>
-                <b>{formatBytes(memorySnapshot?.workingSetBytes)}</b>
+                <span>系统内存总量</span>
+                <b id="mem-total">{fmtMB(memTotalMB)}</b>
               </div>
               <div className="cache-storage-row">
-                <span>私有提交</span>
-                <b>{formatBytes(memorySnapshot?.privateBytes)}</b>
+                <span>系统已用</span>
+                <b id="mem-used">{fmtMB(memUsedMB)}</b>
               </div>
               <div className="cache-storage-row">
                 <span>系统内存占用</span>
-                <b>
-                  {memorySnapshot?.systemUsedPercent != null
-                    ? `${memorySnapshot.systemUsedPercent.toFixed(1)}%`
+                <b id="mem-percent">
+                  {memUsedPercent != null && Number.isFinite(memUsedPercent)
+                    ? `${memUsedPercent.toFixed(1)}%`
                     : memorySnapshot?.platform || '—'}
+                </b>
+              </div>
+              <div className="cache-storage-row">
+                <span>进程内存</span>
+                <b id="mem-process">{fmtMB(procMB)}</b>
+              </div>
+              <div className="cache-storage-row">
+                <span>私有提交</span>
+                <b>
+                  {memorySnapshot?.process?.privateMB != null
+                    ? fmtMB(memorySnapshot.process.privateMB)
+                    : formatBytes(memorySnapshot?.privateBytes)}
                 </b>
               </div>
               <div className="memory-action-row" style={{ marginTop: 8 }}>
@@ -1192,8 +1554,32 @@ export function FxConsoleModal({ onToast }: FxConsoleModalProps): React.ReactEle
                 <span>{cacheSettings?.cDriveProtected ? 'C盘保护' : '已就绪'}</span>
               </div>
               <code className="cache-storage-path" id="cache-storage-root">
-                {cacheSettings?.effectiveRoot || cacheSettings?.cacheRoot || '默认应用数据目录'}
+                {cacheRootText}
               </code>
+              {cacheUsage && (
+                <div id="cache-usage" className="cache-storage-usage">
+                  <div className="cache-storage-row">
+                    <span>歌词缓存</span>
+                    <b>{formatBytes(cacheUsage.lyricsBytes)}</b>
+                  </div>
+                  <div className="cache-storage-row">
+                    <span>节拍缓存</span>
+                    <b>{formatBytes(cacheUsage.beatmapsBytes)}</b>
+                  </div>
+                  <div className="cache-storage-row">
+                    <span>Wallpaper Engine</span>
+                    <b>{formatBytes(cacheUsage.wallpaperEngineBytes)}</b>
+                  </div>
+                  <div className="cache-storage-row">
+                    <span>用户数据</span>
+                    <b>{formatBytes(cacheUsage.userDataBytes)}</b>
+                  </div>
+                  <div className="cache-storage-row">
+                    <span>托管合计</span>
+                    <b id="cache-usage-total">{formatBytes(cacheUsage.totalManagedBytes)}</b>
+                  </div>
+                </div>
+              )}
               <div className="cache-storage-actions">
                 <button
                   className="fx-mini-btn ghost"
@@ -1278,10 +1664,10 @@ export function FxConsoleModal({ onToast }: FxConsoleModalProps): React.ReactEle
               )}
 
               <div className="wallpaper-engine-grid" style={{ marginTop: 8 }}>
-                {weProjects.length === 0 ? (
+                {visibleWeProjects.length === 0 ? (
                   <div className="fx-sub">暂无本地索引项目，点击“添加 WE 目录”扫描</div>
                 ) : (
-                  weProjects.slice(0, 12).map((proj) => (
+                  visibleWeProjects.slice(0, 12).map((proj) => (
                     <div
                       key={proj.id}
                       className="queue-item"
