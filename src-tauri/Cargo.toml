@@ -1,0 +1,77 @@
+[package]
+name = "mineradio"
+version = "2.2.0"
+description = "Windows 沉浸式音乐播放器，融合桌面模式、歌词舞台、粒子视觉和 3D 歌单架。"
+authors = ["Mineradio"]
+license = "GPL-3.0-only"
+edition = "2021"
+
+[lib]
+name = "mineradio_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png", "image-ico", "devtools", "macos-private-api"] }
+tauri-plugin-single-instance = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-dialog = "2"
+
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tower-http = { version = "0.6", features = ["cors", "fs"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "cookies", "gzip", "deflate"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+aes = "0.8"
+cbc = "0.1"
+ecb = "0.1"
+ctr = "0.9"
+cipher = "0.4"
+md-5 = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+base64 = "0.22"
+hex = "0.4"
+num-bigint = "0.4"
+rand = "0.8"
+
+lofty = "0.22"
+symphonia = { version = "0.5", features = ["mp3", "aac", "isomp4", "flac", "ogg", "pcm", "wav"] }
+encoding_rs = "0.8"
+qrcode = "0.14"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "ico"] }
+
+url = "2"
+percent-encoding = "2"
+bytes = "1"
+futures-util = "0.3"
+regex = "1"
+dirs = "6"
+walkdir = "2"
+opener = "0.7"
+arboard = "3"
+chrono = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Dwm",
+  "Win32_Graphics_Gdi",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Threading",
+  "Win32_System_Memory",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_Security",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
