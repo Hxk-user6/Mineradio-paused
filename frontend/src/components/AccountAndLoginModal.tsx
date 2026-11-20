@@ -47,6 +47,7 @@ export function AccountAndLoginModal({
   const unlockEasterEgg = usePlayerStore((s) => s.unlockEasterEgg);
   const resetEasterEgg = usePlayerStore((s) => s.resetEasterEgg);
   const refreshLoginStatuses = usePlayerStore((s) => s.refreshLoginStatuses);
+  const refreshAllUserPlaylists = usePlayerStore((s) => s.refreshAllUserPlaylists);
   const checkUpdates = usePlayerStore((s) => s.checkUpdates);
 
   const [internalLoginOpen, setInternalLoginOpen] = useState(false);
@@ -70,7 +71,11 @@ export function AccountAndLoginModal({
 
   // 彩蛋解锁状态
   const [wishText, setWishText] = useState('');
-  const [wishRevealed, setWishRevealed] = useState(true);
+  const [eyeTaps, setEyeTaps] = useState(0);
+  const [cinematic, setCinematic] = useState(false);
+  const [confirmLogoutAll, setConfirmLogoutAll] = useState(false);
+  const wishRevealed = eyeTaps >= 5;
+  const cinematicTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [eggStatusText, setEggStatusText] = useState('');
   const [eggStatusMode, setEggStatusMode] = useState<'hint' | 'error' | 'success' | ''>('');
   const [eggBusy, setEggBusy] = useState(false);
@@ -102,9 +107,23 @@ export function AccountAndLoginModal({
   useEffect(() => {
     if (!loginOpen) {
       stopPolling();
+      setConfirmLogoutAll(false);
     }
     return () => stopPolling();
   }, [loginOpen, stopPolling]);
+
+  useEffect(() => {
+    const off = desktopWindow.onPlatformLoginSuccess(() => {
+      refreshLoginStatuses().catch(() => {});
+      refreshAllUserPlaylists().catch(() => {});
+      setQrStatus('官方弹窗登录成功，已同步账号信息');
+      setQrStateClass('scan');
+    });
+    return () => {
+      if (typeof off === 'function') off();
+      if (cinematicTimerRef.current) clearTimeout(cinematicTimerRef.current);
+    };
+  }, [refreshLoginStatuses, refreshAllUserPlaylists]);
 
   const handleSubmitEasterEgg = async (e?: React.FormEvent) => {
     e?.preventDefault();
@@ -122,6 +141,9 @@ export function AccountAndLoginModal({
         setEggStatusMode('success');
         setEggStatusText(res.message || '已解锁全平台登录入口');
         setWishText('');
+        setCinematic(true);
+        if (cinematicTimerRef.current) clearTimeout(cinematicTimerRef.current);
+        cinematicTimerRef.current = setTimeout(() => setCinematic(false), 2600);
         onToast?.('已达成成就：世界和平！');
       } else {
         setEggStatusMode('error');
@@ -281,6 +303,31 @@ export function AccountAndLoginModal({
     }
   };
 
+  const handleOfficialLogin = async (target: LoginProvider) => {
+    setAuthBusy(true);
+    setQrStatus('正在打开官方登录弹窗...');
+    setQrStateClass('preview');
+    try {
+      const forceReauth = Boolean(platformLogins[target]?.loggedIn);
+      const res =
+        target === 'netease'
+          ? await desktopWindow.openNeteaseMusicLogin(forceReauth)
+          : target === 'qq'
+          ? await desktopWindow.openQQMusicLogin(forceReauth)
+          : target === 'kugou'
+          ? await desktopWindow.openKugouMusicLogin(forceReauth)
+          : await desktopWindow.openQishuiAuthLogin(forceReauth);
+      if (!res.ok) throw new Error(res.error || '无法打开官方登录弹窗');
+      setQrStatus('请在弹出的官方窗口中完成登录');
+      setQrStateClass('scan');
+    } catch (err) {
+      setQrStatus(err instanceof Error ? err.message : '官方登录弹窗打开失败');
+      setQrStateClass('fail');
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
   const handleSubmitCookie = async () => {
     const trimmed = cookieText.trim();
     if (!trimmed) {
@@ -341,6 +388,7 @@ export function AccountAndLoginModal({
     } catch {
       // ignore
     }
+    await desktopWindow.clearPlatformLoginSession(target).catch(() => ({ ok: false }));
     await refreshLoginStatuses();
     setQrImg('');
     setQrStatus('已退出当前平台登录');
@@ -356,7 +404,14 @@ export function AccountAndLoginModal({
       apiJson('/api/kugou/logout').catch(() => {}),
       apiJson('/api/qishui/logout').catch(() => {}),
     ]);
+    await Promise.all(
+      (['netease', 'qq', 'kugou', 'qishui'] as LoginProvider[]).map((p) =>
+        desktopWindow.clearPlatformLoginSession(p).catch(() => ({ ok: false }))
+      )
+    );
     await resetEasterEgg();
+    setConfirmLogoutAll(false);
+    setEyeTaps(0);
     setQrImg('');
     setCookieText('');
     setWishText('');
@@ -372,8 +427,15 @@ export function AccountAndLoginModal({
     : null;
   const activeEntry = platformLogins[provider];
 
-  const downloadPages = (updateInfo?.downloadPages || []).filter((p) => isSafeHttpsUrl(p.url));
-  const safeFallbackUrl = isSafeHttpsUrl(updateInfo?.releaseUrl) ? updateInfo!.releaseUrl! : '';
+  const release = updateInfo?.release;
+  const hasUpdate = Boolean(updateInfo?.hasUpdate ?? updateInfo?.updateAvailable);
+  const rawPages =
+    updateInfo?.downloadPages?.length ? updateInfo.downloadPages : release?.downloadPages || [];
+  const downloadPages = rawPages.filter((p) => isSafeHttpsUrl(p.url));
+  const fallbackCandidates = [updateInfo?.releaseUrl, release?.downloadPageUrl, release?.htmlUrl];
+  const safeFallbackUrl = fallbackCandidates.find((u) => isSafeHttpsUrl(u)) || '';
+  const rawNotes = updateInfo?.notes || release?.notes || release?.summary || '';
+  const updateNotes = Array.isArray(rawNotes) ? rawNotes.join('\n') : String(rawNotes || '');
   const targetUpdateUrl = downloadPages[selectedPageIdx]?.url || downloadPages[0]?.url || safeFallbackUrl;
 
   const handleOpenUpdateExternal = async () => {
@@ -421,9 +483,9 @@ export function AccountAndLoginModal({
           }
           aria-label="账号与登录"
         >
-          {primaryAccount?.avatarUrl ? (
+          {primaryAccount?.avatar || primaryAccount?.avatarUrl ? (
             <img
-              src={primaryAccount.avatarUrl}
+              src={primaryAccount.avatar || primaryAccount.avatarUrl}
               alt={primaryAccount.nickname || 'user'}
               style={{ width: '100%', height: '100%', borderRadius: '50%', objectFit: 'cover' }}
             />
@@ -461,11 +523,15 @@ export function AccountAndLoginModal({
                 className="login-reset-all-btn"
                 type="button"
                 onClick={() => {
+                  if (!confirmLogoutAll) {
+                    setConfirmLogoutAll(true);
+                    return;
+                  }
                   handleLogoutAllAndReset().catch(() => {});
                 }}
                 title="清除所有平台登录并重新锁定彩蛋"
               >
-                退出登录
+                {confirmLogoutAll ? '再次点击确认退出全部账号' : '退出登录'}
               </button>
             )}
             <button
@@ -487,7 +553,7 @@ export function AccountAndLoginModal({
                 id="login-easter-eye-trigger"
                 className="login-easter-eye-trigger"
                 type="button"
-                onClick={() => setWishRevealed(true)}
+                onClick={() => setEyeTaps((n) => Math.min(5, n + 1))}
                 aria-label="轻触大小眼"
               >
                 <span className="login-easter-eyes" aria-hidden="true">
@@ -496,9 +562,10 @@ export function AccountAndLoginModal({
                 </span>
               </button>
               <div id="login-easter-hint" className="login-easter-hint" aria-live="polite">
-                轻触大小眼，许下四个字的心愿
+                {wishRevealed ? '许下四个字的心愿' : '轻触大小眼'}
               </div>
 
+              {wishRevealed && (
               <form
                 id="login-easter-egg-wish"
                 className="login-easter-egg-wish"
@@ -525,7 +592,6 @@ export function AccountAndLoginModal({
                     autoCapitalize="off"
                     spellCheck={false}
                     maxLength={12}
-                    placeholder="世界和平"
                     aria-label="输入四个字的愿望"
                     value={wishText}
                     onChange={(e) => {
@@ -553,6 +619,7 @@ export function AccountAndLoginModal({
                   </button>
                 </div>
               </form>
+              )}
             </section>
           ) : (
             <>
@@ -668,6 +735,17 @@ export function AccountAndLoginModal({
                     </button>
                   )}
                   <button
+                    id="official-login-btn"
+                    className="modal-btn"
+                    type="button"
+                    disabled={authBusy}
+                    onClick={() => {
+                      handleOfficialLogin(provider).catch(() => {});
+                    }}
+                  >
+                    官方弹窗登录
+                  </button>
+                  <button
                     id="qq-cookie-toggle-btn"
                     className="modal-btn"
                     type="button"
@@ -695,6 +773,21 @@ export function AccountAndLoginModal({
         </div>
       </div>
 
+      {cinematic && (
+        <div
+          id="login-easter-unlock-cinematic"
+          className="login-easter-unlock-cinematic show"
+          role="status"
+          aria-live="polite"
+        >
+          <span className="login-easter-eyes" aria-hidden="true">
+            <i className="login-easter-eye login-easter-eye-big" />
+            <i className="login-easter-eye login-easter-eye-small" />
+          </span>
+          <b>世界和平</b>
+        </div>
+      )}
+
       {/* 版本更新详情模态 */}
       <div
         id="update-modal"
@@ -712,7 +805,7 @@ export function AccountAndLoginModal({
               <div>
                 <div className="update-kicker">MINERADIO</div>
                 <div id="update-modal-title" className="update-title">
-                  {updateInfo?.hasUpdate ? '发现新版本' : '版本信息'}
+                  {hasUpdate ? '发现新版本' : '版本信息'}
                 </div>
                 <div id="update-modal-version" className="update-version">
                   {updateInfo?.latestVersion || updateInfo?.currentVersion || 'v2.2.0'}
@@ -730,9 +823,9 @@ export function AccountAndLoginModal({
               </div>
             </div>
 
-            {updateInfo?.notes && (
+            {updateNotes && (
               <div id="update-list" className="update-list" style={{ marginBottom: 14, fontSize: 12 }}>
-                {updateInfo.notes}
+                {updateNotes}
               </div>
             )}
 
