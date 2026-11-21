@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { apiJson, desktopWindow } from '../bridge/tauriBridge';
+import { apiJson, coverProxyUrl, desktopWindow } from '../bridge/tauriBridge';
 import { usePlayerStore } from '../store/playerStore';
 import type { ProviderType } from '../types/mineradio';
 
@@ -574,6 +574,11 @@ export function AccountAndLoginModal({
           }`}
           type="button"
           onClick={openLogin}
+          style={
+            primaryAccount?.loggedIn
+              ? { maxWidth: 168, overflow: 'hidden', flexShrink: 0 }
+              : undefined
+          }
           title={
             primaryAccount?.loggedIn
               ? `已登录：${primaryAccount.nickname || '账号中心'}`
@@ -582,11 +587,36 @@ export function AccountAndLoginModal({
           aria-label="账号与登录"
         >
           {primaryAccount?.avatar || primaryAccount?.avatarUrl ? (
-            <img
-              src={primaryAccount.avatar || primaryAccount.avatarUrl}
-              alt={primaryAccount.nickname || 'user'}
-              style={{ width: '100%', height: '100%', borderRadius: '50%', objectFit: 'cover' }}
-            />
+            <>
+              <img
+                id="user-avatar"
+                src={coverProxyUrl(primaryAccount.avatar || primaryAccount.avatarUrl)}
+                alt={primaryAccount.nickname || 'user'}
+                style={{
+                  width: 34,
+                  height: 34,
+                  minWidth: 34,
+                  minHeight: 34,
+                  borderRadius: '50%',
+                  objectFit: 'cover',
+                  flexShrink: 0,
+                }}
+              />
+              {primaryAccount.loggedIn && (
+                <span
+                  style={{
+                    maxWidth: 96,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                    fontSize: 12,
+                    fontWeight: 500,
+                  }}
+                >
+                  {primaryAccount.nickname || '已登录'}
+                </span>
+              )}
+            </>
           ) : (
             <span className="login-easter-eyes compact" aria-hidden="true">
               <i className="login-easter-eye login-easter-eye-big" />

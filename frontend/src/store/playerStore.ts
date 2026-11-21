@@ -436,6 +436,21 @@ let searchRequestSeq = 0;
 let playRequestSeq = 0;
 let playlistTracksRequestSeq = 0;
 
+function resolveSongDurationSeconds(song: SongRecord | null | undefined): number {
+  if (!song) return 0;
+  const ms = Number(song.durationMs ?? song.dt ?? 0);
+  if (Number.isFinite(ms) && ms > 0) {
+    return ms > 1000 ? Math.round(ms / 1000) : ms;
+  }
+  const raw = Number(song.duration) || 0;
+  if (!Number.isFinite(raw) || raw <= 0) return 0;
+  const provider = String(song.provider || song.source || 'netease').toLowerCase();
+  if (provider === 'netease' || provider === 'qq' || provider === 'kugou') {
+    return raw > 1000 ? Math.round(raw / 1000) : raw;
+  }
+  return raw > 18000 ? Math.round(raw / 1000) : raw;
+}
+
 function mapPodcastSearchEntries(rawPodcasts: unknown): SongRecord[] {
   if (!Array.isArray(rawPodcasts)) return [];
   const out: SongRecord[] = [];
@@ -680,7 +695,7 @@ export const usePlayerStore = create<PlayerStoreState>()((set, get) => ({
             currentSong: nextSong,
             currentIdx: nextIndex,
             currentTime: 0,
-            duration: Number(nextSong.duration) || 0,
+            duration: resolveSongDurationSeconds(nextSong),
             playing: true,
             lyrics: [],
             activeLyricIdx: -1,
@@ -955,7 +970,7 @@ export const usePlayerStore = create<PlayerStoreState>()((set, get) => ({
         currentIdx: targetIdx,
         currentSong: targetSong,
         currentTime: 0,
-        duration: Number(targetSong!.duration) || 0,
+        duration: resolveSongDurationSeconds(targetSong),
         audioError: null,
         lyrics: [],
         activeLyricIdx: -1,

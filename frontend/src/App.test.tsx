@@ -601,4 +601,33 @@ describe('Mineradio UI & Desktop Lyrics', () => {
     expect(onToast).toHaveBeenCalledWith('QQ 音乐暂不支持红心收藏，请前往 QQ 音乐客户端操作');
     expect(fetchSpy.mock.calls.some(([u]) => String(u).includes('/api/qq/like'))).toBe(false);
   });
+
+  it('已登录账号顶栏头像保持 34x34 紧凑尺寸且网易云毫秒时长自动换算为秒', async () => {
+    usePlayerStore.setState({
+      platformLogins: {
+        netease: {
+          loggedIn: true,
+          nickname: '极长昵称测试账号超过十个字',
+          avatar: 'https://example.com/big-avatar.jpg',
+        },
+        qq: { loggedIn: false },
+        kugou: { loggedIn: false },
+        qishui: { loggedIn: false },
+      },
+    });
+    const { container } = render(<AccountAndLoginModal />);
+    const btn = container.querySelector('#user-btn') as HTMLButtonElement;
+    const avatar = container.querySelector('#user-avatar') as HTMLImageElement;
+    expect(btn.style.maxWidth).toBe('168px');
+    expect(avatar.style.width).toBe('34px');
+    expect(avatar.style.height).toBe('34px');
+
+    await usePlayerStore.getState().playSong({
+      id: '3451586363',
+      name: 'Claude Opus 5.5の小曲',
+      provider: 'netease',
+      duration: 134306,
+    });
+    expect(usePlayerStore.getState().duration).toBe(134);
+  });
 });

@@ -2441,15 +2441,20 @@ async fn qishui_lyric(
 
 // ---------- 代理与本地媒体流 ----------
 
-fn is_forbidden_ip(ip: IpAddr) -> bool {
+fn is_forbidden_ip_core(ip: IpAddr, allow_proxy_fake_ip: bool) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             let o = v4.octets();
             let is_this_net = o[0] == 0;
             let is_cgnat = o[0] == 100 && (o[1] & 0b1100_0000) == 64;
-            let is_bench = o[0] == 198 && (o[1] == 18 || o[1] == 19);
+            let is_bench_fake_ip = o[0] == 198 && (o[1] == 18 || o[1] == 19);
             let is_ietf = o[0] == 192 && o[1] == 0 && o[2] == 0;
             let is_reserved = o[0] >= 240;
+            let blocked_proxy_range = if allow_proxy_fake_ip {
+                false
+            } else {
+                is_cgnat || is_bench_fake_ip
+            };
             v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
@@ -2458,14 +2463,13 @@ fn is_forbidden_ip(ip: IpAddr) -> bool {
                 || v4.is_multicast()
                 || v4.is_documentation()
                 || is_this_net
-                || is_cgnat
-                || is_bench
                 || is_ietf
                 || is_reserved
+                || blocked_proxy_range
         }
         IpAddr::V6(v6) => {
             if let Some(mapped) = v6.to_ipv4_mapped() {
-                return is_forbidden_ip(IpAddr::V4(mapped));
+                return is_forbidden_ip_core(IpAddr::V4(mapped), allow_proxy_fake_ip);
             }
             let seg0 = v6.segments()[0];
             let is_ula = (seg0 & 0xfe00) == 0xfc00;
@@ -2473,6 +2477,14 @@ fn is_forbidden_ip(ip: IpAddr) -> bool {
             v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() || is_ula || is_link_local
         }
     }
+}
+
+fn is_forbidden_ip(ip: IpAddr) -> bool {
+    is_forbidden_ip_core(ip, false)
+}
+
+fn is_forbidden_resolved_ip(ip: IpAddr) -> bool {
+    is_forbidden_ip_core(ip, true)
 }
 
 fn validate_external_media_url_syntax(raw_url: &str) -> Result<url::Url, (StatusCode, &'static str)> {
@@ -2533,7 +2545,7 @@ async fn validate_and_resolve_external_url(raw_url: &str) -> Result<url::Url, (S
         let port = parsed.port_or_known_default().unwrap_or(443);
         if let Ok(addrs) = tokio::net::lookup_host((domain, port)).await {
             for addr in addrs {
-                if is_forbidden_ip(addr.ip()) {
+                if is_forbidden_resolved_ip(addr.ip()) {
                     return Err((StatusCode::FORBIDDEN, "Resolved private or loopback ip blocked"));
                 }
             }
@@ -3642,6 +3654,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(qq_like.status(), StatusCode::NOT_IMPLEMENTED);
+
+        // 字面 Fake-IP 直连仍被拦截，而经过公网域名解析出的代理 Fake-IP (198.18.0.28) 允许通过
+        let fake_ip: IpAddr = "198.18.0.28".parse().unwrap();
+        assert!(is_forbidden_ip(fake_ip));
+        assert!(!is_forbidden_resolved_ip(fake_ip));
+        assert!(is_forbidden_resolved_ip("127.0.0.1".parse().unwrap()));
+        assert!(is_forbidden_resolved_ip("169.254.169.254".parse().unwrap()));
     }
 
     fn urlencoding_for_test(raw: &str) -> String {
