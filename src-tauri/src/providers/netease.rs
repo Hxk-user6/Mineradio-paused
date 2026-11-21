@@ -1735,19 +1735,21 @@ impl NeteaseClient {
                 reqwest::header::CONTENT_TYPE,
                 "application/x-www-form-urlencoded",
             );
-        if !cookie.is_empty() {
-            let mut full_cookie = parse_cookie_string(&cookie);
-            full_cookie
-                .entry("os".to_string())
-                .or_insert_with(|| "pc".to_string());
-            full_cookie
-                .entry("appver".to_string())
-                .or_insert_with(|| "3.0.18.203152".to_string());
-            req = req.header(
-                reqwest::header::COOKIE,
-                serialize_cookie_object(&full_cookie),
-            );
-        }
+        let mut full_cookie = if cookie.is_empty() {
+            BTreeMap::new()
+        } else {
+            parse_cookie_string(&cookie)
+        };
+        full_cookie
+            .entry("os".to_string())
+            .or_insert_with(|| "pc".to_string());
+        full_cookie
+            .entry("appver".to_string())
+            .or_insert_with(|| "3.0.18.203152".to_string());
+        req = req.header(
+            reqwest::header::COOKIE,
+            serialize_cookie_object(&full_cookie),
+        );
 
         let resp = req
             .form(&[
@@ -3591,7 +3593,12 @@ impl NeteaseClient {
             if !cookie_str.is_empty() {
                 let _ = self.set_cookie(&cookie_str);
             }
-            let mut info = self.login_status().await.unwrap_or_else(|_| json!({ "loggedIn": false }));
+            let has_saved_cookie = !cookie_str.is_empty() || self.has_cookie();
+            let mut info = tokio::time::timeout(Duration::from_millis(2500), self.login_status())
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or_else(|| json!({ "loggedIn": false }));
             if !info
                 .get("loggedIn")
                 .and_then(|v| v.as_bool())
@@ -3623,7 +3630,7 @@ impl NeteaseClient {
                 .get("loggedIn")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false)
-                && !cookie_str.is_empty()
+                && has_saved_cookie
             {
                 let nickname = body
                     .get("nickname")
@@ -3650,7 +3657,7 @@ impl NeteaseClient {
             let mut out = info.as_object().cloned().unwrap_or_default();
             out.insert("code".into(), json!(code));
             out.insert("message".into(), json!(msg));
-            out.insert("hasCookie".into(), json!(!cookie_str.is_empty()));
+            out.insert("hasCookie".into(), json!(has_saved_cookie));
             return Ok(Value::Object(out));
         }
 
