@@ -10,11 +10,11 @@
     "frontendDist": "../frontend/dist"
   },
   "app": {
-    "withGlobalTauri": true,
+    "withGlobalTauri": false,
     "macOSPrivateApi": true,
     "windows": [],
     "security": {
-      "csp": null
+      "csp": "default-src 'self' tauri: http://tauri.localhost https://tauri.localhost http://127.0.0.1:* http://localhost:*; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' data: https://fonts.gstatic.com https:; img-src 'self' data: blob: asset: http://asset.localhost https://asset.localhost mineradio-local: http://mineradio-local.localhost https://mineradio-local.localhost mineradio-wallpaper: http://mineradio-wallpaper.localhost https://mineradio-wallpaper.localhost http://127.0.0.1:* http://localhost:* https:; media-src 'self' data: blob: mineradio-local: http://mineradio-local.localhost https://mineradio-local.localhost mineradio-wallpaper: http://mineradio-wallpaper.localhost https://mineradio-wallpaper.localhost http://127.0.0.1:* http://localhost:*; connect-src 'self' blob: data: ipc: http://ipc.localhost https://ipc.localhost tauri: http://tauri.localhost https://tauri.localhost http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:*; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
     }
   },
   "bundle": {

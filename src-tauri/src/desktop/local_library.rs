@@ -203,7 +203,7 @@ fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> String {
     s[..end].to_string()
 }
 
-fn constant_time_eq(a: &str, b: &str) -> bool {
+pub fn constant_time_eq(a: &str, b: &str) -> bool {
     let aa = a.as_bytes();
     let bb = b.as_bytes();
     let max_len = aa.len().max(bb.len());
@@ -695,7 +695,11 @@ impl LocalMusicLibrary {
 
     /// 返回用于鉴权 `mineradio-local://` 媒体请求的会话能力令牌。
     pub fn media_token(&self) -> String {
-        self.state.lock().unwrap().media_token.clone()
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .media_token
+            .clone()
     }
 
     pub fn library_directory(&self) -> &Path {
@@ -704,7 +708,7 @@ impl LocalMusicLibrary {
 
     /// 返回当前已导入的全部本地曲目列表。
     pub fn list_tracks(&self) -> LocalTracksResult {
-        let guard = self.state.lock().unwrap();
+        let guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
         Self::build_tracks_result(&guard, None, None, None)
     }
 

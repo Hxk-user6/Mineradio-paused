@@ -116,8 +116,9 @@ mod imp {
     use std::mem::{size_of, zeroed};
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{
-        CloseHandle, BOOL, HANDLE, HWND, LPARAM, LUID, TRUE, WPARAM,
+        CloseHandle, BOOL, HANDLE, HWND, LPARAM, LUID, POINT, TRUE, WPARAM,
     };
+    use windows::Win32::Graphics::Gdi::ScreenToClient;
     use windows::Win32::Security::{
         AdjustTokenPrivileges, GetTokenInformation, LookupPrivilegeValueW, TokenElevation,
         SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_ELEVATION, TOKEN_PRIVILEGES,
@@ -131,10 +132,10 @@ mod imp {
         PROCESS_QUERY_INFORMATION, PROCESS_SET_QUOTA,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, FindWindowExW, FindWindowW, GetClassNameW, GetParent, GetWindowLongPtrW,
-        IsWindow, SendMessageTimeoutW, SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-        GWL_STYLE, HWND_BOTTOM, SEND_MESSAGE_TIMEOUT_FLAGS, SWP_NOACTIVATE, SWP_NOMOVE,
-        SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, WS_CHILD, WS_POPUP,
+        EnumWindows, FindWindowExW, FindWindowW, GetClassNameW, GetCursorPos, GetParent,
+        GetWindowLongPtrW, IsWindow, SendMessageTimeoutW, SetParent, SetWindowLongPtrW,
+        SetWindowPos, ShowWindow, GWL_STYLE, HWND_BOTTOM, SEND_MESSAGE_TIMEOUT_FLAGS, SWP_NOACTIVATE,
+        SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, WS_CHILD, WS_POPUP,
     };
 
     const SYSTEM_MEMORY_LIST_INFORMATION: i32 = 0x50;
@@ -675,7 +676,27 @@ mod imp {
             }
             let list_view = HWND(list_view_raw as *mut c_void);
             let _ = ShowWindow(list_view, if visible { SW_SHOW } else { SW_HIDE });
-            Ok(true)
+            Ok(visible)
+        }
+    }
+
+    pub fn get_cursor_client_pos(hwnd_raw: isize) -> Option<(i32, i32)> {
+        if hwnd_raw == 0 {
+            return None;
+        }
+        unsafe {
+            let hwnd = HWND(hwnd_raw as *mut c_void);
+            if !IsWindow(hwnd).as_bool() {
+                return None;
+            }
+            let mut pt = POINT { x: 0, y: 0 };
+            if GetCursorPos(&mut pt).is_err() {
+                return None;
+            }
+            if !ScreenToClient(hwnd, &mut pt).as_bool() {
+                return None;
+            }
+            Some((pt.x, pt.y))
         }
     }
 }
@@ -750,11 +771,15 @@ mod imp {
     }
 
     pub fn set_desktop_icons_visible(_visible: bool) -> Result<bool, String> {
-        Ok(false)
+        Ok(true)
+    }
+
+    pub fn get_cursor_client_pos(_hwnd_raw: isize) -> Option<(i32, i32)> {
+        None
     }
 }
 
 pub use imp::{
-    find_workerw, get_memory_snapshot_win32, purge_system_memory_win32,
+    find_workerw, get_cursor_client_pos, get_memory_snapshot_win32, purge_system_memory_win32,
     set_desktop_icons_visible, set_full_desktop_attached, trim_app_memory_win32,
 };

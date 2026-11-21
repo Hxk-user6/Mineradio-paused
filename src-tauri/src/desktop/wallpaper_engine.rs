@@ -1232,12 +1232,17 @@ impl WallpaperEngineLibrary {
         }
     }
 
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, LibraryState> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// 轻量只读获取 WE 媒体鉴权令牌，绝不触发磁盘扫描。
+    pub fn media_token(&self) -> String {
+        self.lock_state().media_token.clone()
+    }
+
     pub fn user_data_dir(&self) -> PathBuf {
-        self.state
-            .lock()
-            .expect("wallpaper library mutex poisoned")
-            .user_data_dir
-            .clone()
+        self.lock_state().user_data_dir.clone()
     }
 
     fn perform_scan_locked(state: &mut LibraryState) -> WallpaperLibrarySnapshot {
@@ -1371,10 +1376,7 @@ impl WallpaperEngineLibrary {
     }
 
     pub fn list_projects(&self, force_refresh: bool) -> WallpaperLibrarySnapshot {
-        let mut state = self
-            .state
-            .lock()
-            .expect("wallpaper library mutex poisoned");
+        let mut state = self.lock_state();
         if !force_refresh {
             if let Some(ref cached) = state.snapshot {
                 if now_millis().saturating_sub(cached.scanned_at) < CACHE_TTL_MS {
@@ -1394,10 +1396,7 @@ impl WallpaperEngineLibrary {
             return Err("所选目录中没有识别到 project.json".to_string());
         }
 
-        let mut state = self
-            .state
-            .lock()
-            .expect("wallpaper library mutex poisoned");
+        let mut state = self.lock_state();
         let target_key = path_key(&normalized);
         if !state
             .manual_roots
@@ -1458,10 +1457,7 @@ impl WallpaperEngineLibrary {
             return Err("场景包同目录缺少有效的 Scene project.json".to_string());
         }
 
-        let mut state = self
-            .state
-            .lock()
-            .expect("wallpaper library mutex poisoned");
+        let mut state = self.lock_state();
         let root_key = path_key(&project_root);
         if !state
             .manual_roots
@@ -1491,10 +1487,7 @@ impl WallpaperEngineLibrary {
     }
 
     pub fn remove_directory(&self, root_id: &str) -> Result<WallpaperLibrarySnapshot, String> {
-        let mut state = self
-            .state
-            .lock()
-            .expect("wallpaper library mutex poisoned");
+        let mut state = self.lock_state();
         let target_id = root_id.trim();
         let removed_roots: Vec<PathBuf> = state
             .manual_roots
@@ -1521,10 +1514,7 @@ impl WallpaperEngineLibrary {
             return Err("WALLPAPER_PROJECT_ID_INVALID".to_string());
         }
 
-        let mut state = self
-            .state
-            .lock()
-            .expect("wallpaper library mutex poisoned");
+        let mut state = self.lock_state();
         if state.snapshot.is_none() {
             Self::perform_scan_locked(&mut state);
         }
@@ -1594,10 +1584,7 @@ impl WallpaperEngineLibrary {
             return Err("WALLPAPER_PROJECT_ID_INVALID".to_string());
         }
 
-        let mut state = self
-            .state
-            .lock()
-            .expect("wallpaper library mutex poisoned");
+        let mut state = self.lock_state();
         if state.snapshot.is_none() {
             Self::perform_scan_locked(&mut state);
         }
@@ -1612,10 +1599,9 @@ impl WallpaperEngineLibrary {
     }
 
     pub fn get_wallpaper_mode_status(&self) -> WallpaperModeStatus {
-        let _state = self
-            .state
-            .lock()
-            .expect("wallpaper library mutex poisoned");
+        let state = self.lock_state();
+        let enabled = state.wallpaper_mode_enabled;
+        drop(state);
         #[cfg(target_os = "windows")]
         {
             let workerw = crate::desktop::win32::find_workerw()
@@ -1624,7 +1610,7 @@ impl WallpaperEngineLibrary {
             WallpaperModeStatus {
                 ok: true,
                 supported: true,
-                enabled: state.wallpaper_mode_enabled,
+                enabled,
                 platform: "win32".to_string(),
                 workerw_window_id: workerw,
                 message: None,
@@ -1632,6 +1618,7 @@ impl WallpaperEngineLibrary {
         }
         #[cfg(not(target_os = "windows"))]
         {
+            let _ = enabled;
             WallpaperModeStatus {
                 ok: true,
                 supported: false,
@@ -1644,10 +1631,7 @@ impl WallpaperEngineLibrary {
     }
 
     pub fn set_wallpaper_mode(&self, enabled: bool) -> Result<WallpaperModeStatus, String> {
-        let mut state = self
-            .state
-            .lock()
-            .expect("wallpaper library mutex poisoned");
+        let mut state = self.lock_state();
         #[cfg(target_os = "windows")]
         {
             let workerw = if enabled {
@@ -1892,6 +1876,7 @@ mod tests {
     fn wallpaper_mode_status_degrades_gracefully_off_windows() {
         let user_dir = TempDir::new().unwrap();
         let lib = WallpaperEngineLibrary::with_auto_discover(user_dir.path(), false);
+        assert!(!lib.media_token().is_empty());
         let status = lib.get_wallpaper_mode_status();
         #[cfg(not(target_os = "windows"))]
         {

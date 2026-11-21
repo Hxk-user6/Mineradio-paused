@@ -88,6 +88,9 @@ fn build_protocol_error(status: u16, msg: &str) -> tauri::http::Response<Vec<u8>
         .unwrap()
 }
 
+const PROTOCOL_FULL_READ_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const PROTOCOL_RANGE_CHUNK_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
 fn build_range_file_protocol_response(
     path: &Path,
     mime: &str,
@@ -111,19 +114,28 @@ fn build_range_file_protocol_response(
             .unwrap();
     }
 
-    if let Some(rh) = range_header {
-        if let Some(spec) = rh.strip_prefix("bytes=") {
+    if let Some(rh) = range_header.map(str::trim) {
+        if rh.len() >= 6 && rh[..6].eq_ignore_ascii_case("bytes=") {
+            let spec = &rh[6..];
             let mut parts = spec.split('-');
             let s_str = parts.next().unwrap_or("").trim();
             let e_str = parts.next().unwrap_or("").trim();
             let (start, end) = match (s_str.parse::<u64>(), e_str.parse::<u64>()) {
-                (Ok(s), Ok(e)) => (s, e.min(size - 1)),
-                (Ok(s), Err(_)) => (s, (s + 4 * 1024 * 1024 - 1).min(size - 1)),
-                (Err(_), Ok(suffix)) => {
-                    let s = size.saturating_sub(suffix);
+                (Ok(s), Ok(e)) => (
+                    s,
+                    e.min(s.saturating_add(PROTOCOL_RANGE_CHUNK_MAX_BYTES - 1))
+                        .min(size - 1),
+                ),
+                (Ok(s), Err(_)) => (
+                    s,
+                    s.saturating_add(4 * 1024 * 1024 - 1).min(size - 1),
+                ),
+                (Err(_), Ok(suffix)) if suffix > 0 => {
+                    let capped_suffix = suffix.min(PROTOCOL_RANGE_CHUNK_MAX_BYTES);
+                    let s = size.saturating_sub(capped_suffix);
                     (s, size - 1)
                 }
-                _ => (0, size - 1),
+                _ => (0, size.saturating_sub(1).min(PROTOCOL_FULL_READ_MAX_BYTES - 1)),
             };
             if start >= size || start > end {
                 return tauri::http::Response::builder()
@@ -148,6 +160,24 @@ fn build_range_file_protocol_response(
                 .body(buf)
                 .unwrap();
         }
+    }
+
+    if size > PROTOCOL_FULL_READ_MAX_BYTES {
+        let len = PROTOCOL_FULL_READ_MAX_BYTES as usize;
+        let end = PROTOCOL_FULL_READ_MAX_BYTES - 1;
+        let mut buf = vec![0u8; len];
+        if file.read_exact(&mut buf).is_err() {
+            return build_protocol_error(500, "Read failed");
+        }
+        return tauri::http::Response::builder()
+            .status(206)
+            .header("Access-Control-Allow-Origin", "*")
+            .header("Content-Type", mime)
+            .header("Accept-Ranges", "bytes")
+            .header("Content-Range", format!("bytes 0-{end}/{size}"))
+            .header("Content-Length", len.to_string())
+            .body(buf)
+            .unwrap();
     }
 
     let mut buf = Vec::with_capacity(size as usize);
@@ -245,8 +275,8 @@ pub fn run() {
                 Ok(parsed) => parsed,
                 Err(msg) => return build_protocol_error(400, msg),
             };
-            let expected = state.backend.wallpaper_engine.list_projects(false).media_token;
-            if cap != expected {
+            let expected = state.backend.wallpaper_engine.media_token();
+            if expected.is_empty() || !crate::desktop::local_library::constant_time_eq(cap.trim(), &expected) {
                 return build_protocol_error(403, "Forbidden");
             }
             let Ok(path) = state.backend.wallpaper_engine.resolve_project_file(
@@ -311,10 +341,15 @@ pub fn run() {
                             let state = app.state::<Arc<TauriAppState>>();
                             let _ = commands::set_wallpaper_mode(
                                 app.clone(),
-                                state,
+                                state.clone(),
                                 false,
                                 None,
                             );
+                            if !state.desktop_icons_visible.load(Ordering::Acquire)
+                                && crate::desktop::win32::set_desktop_icons_visible(true).is_ok()
+                            {
+                                state.desktop_icons_visible.store(true, Ordering::Release);
+                            }
                             if let Some(win) = app.get_webview_window("main") {
                                 let _ = win.unminimize();
                                 let _ = win.show();
@@ -322,17 +357,8 @@ pub fn run() {
                             }
                         }
                         "tray_quit" => {
-                            #[cfg(target_os = "windows")]
-                            {
-                                if let Some(win) = app.get_webview_window("main") {
-                                    if let Ok(hwnd) = win.hwnd() {
-                                        let _ = crate::desktop::win32::set_full_desktop_attached(
-                                            hwnd.0 as isize,
-                                            false,
-                                        );
-                                    }
-                                }
-                            }
+                            let state = app.state::<Arc<TauriAppState>>();
+                            commands::cleanup_before_app_exit(app, &state);
                             app.exit(0);
                         }
                         _ => {}
@@ -377,24 +403,14 @@ pub fn run() {
             let state_for_close = tauri_state.clone();
             main_win.on_window_event(move |event| match event {
                 WindowEvent::CloseRequested { api, .. } => {
-                    let behavior = state_for_close.close_behavior.lock().unwrap().clone();
+                    let behavior = commands::lock_unpoisoned(&state_for_close.close_behavior).clone();
                     if behavior != "quit" {
                         api.prevent_close();
                         if let Some(win) = app_handle.get_webview_window("main") {
                             let _ = win.hide();
                         }
                     } else {
-                        #[cfg(target_os = "windows")]
-                        {
-                            if let Some(win) = app_handle.get_webview_window("main") {
-                                if let Ok(hwnd) = win.hwnd() {
-                                    let _ = crate::desktop::win32::set_full_desktop_attached(
-                                        hwnd.0 as isize,
-                                        false,
-                                    );
-                                }
-                            }
-                        }
+                        commands::cleanup_before_app_exit(&app_handle, &state_for_close);
                     }
                 }
                 WindowEvent::Resized(_) => {
@@ -511,5 +527,25 @@ mod tests {
         assert_eq!(id2, "abcdef0123456789abcdef01");
         assert_eq!(rel2, "assets/preview.png");
         assert_eq!(cap2, "tok456");
+    }
+
+    #[test]
+    fn large_protocol_files_chunk_without_full_memory_read_and_parse_case_insensitive_range() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let big_path = dir.path().join("big.mp4");
+        {
+            let f = std::fs::File::create(&big_path).unwrap();
+            f.set_len(PROTOCOL_FULL_READ_MAX_BYTES + 1024).unwrap();
+        }
+        let no_range_resp = build_range_file_protocol_response(&big_path, "video/mp4", None);
+        assert_eq!(no_range_resp.status().as_u16(), 206);
+        assert_eq!(no_range_resp.body().len() as u64, PROTOCOL_FULL_READ_MAX_BYTES);
+
+        let small_path = dir.path().join("small.txt");
+        std::fs::write(&small_path, b"0123456789ABCDEF").unwrap();
+        let ci_range_resp =
+            build_range_file_protocol_response(&small_path, "text/plain", Some("BYTES=2-5"));
+        assert_eq!(ci_range_resp.status().as_u16(), 206);
+        assert_eq!(ci_range_resp.body().as_slice(), b"2345");
     }
 }

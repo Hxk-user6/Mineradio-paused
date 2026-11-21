@@ -8,11 +8,12 @@ use axum::{Json, Router};
 use futures_util::TryStreamExt;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::analyzer::dj::analyze_podcast_dj_stream_with_options;
 use crate::config::{
@@ -47,7 +48,12 @@ const PROTECTED_LOGIN_ROUTES: &[&str] = &[
 ];
 
 const QISHUI_DECRYPT_CACHE_MAX_BYTES: usize = 96 * 1024 * 1024;
+const PROXY_COVER_MAX_BYTES: u64 = 24 * 1024 * 1024;
 const LISTEN_SYNC_JOURNAL_LIMIT: usize = 512;
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 #[derive(Default)]
 struct DecryptCache {
@@ -387,6 +393,7 @@ pub fn build_router(state: Arc<AppBackendState>) -> Router {
         .route("/api/qq/artist/detail", get(qq_artist_detail))
         .route("/api/qq/album/detail", get(qq_album_detail))
         .route("/api/qq/song/comments", get(qq_song_comments))
+        .route("/api/qq/like", post(qq_like_unsupported))
         // Kugou
         .route("/api/kugou/search", get(kugou_search))
         .route("/api/kugou/recommendations", get(kugou_recommendations))
@@ -430,8 +437,70 @@ pub fn build_router(state: Arc<AppBackendState>) -> Router {
             state.clone(),
             easter_egg_gate_middleware,
         ))
-        .layer(CorsLayer::permissive())
+        .layer(
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::predicate(|origin, _| {
+                    is_allowed_cors_origin(origin)
+                }))
+                .allow_methods([
+                    axum::http::Method::GET,
+                    axum::http::Method::POST,
+                    axum::http::Method::PUT,
+                    axum::http::Method::DELETE,
+                    axum::http::Method::OPTIONS,
+                ])
+                .allow_headers([
+                    header::CONTENT_TYPE,
+                    header::AUTHORIZATION,
+                    header::RANGE,
+                    header::ACCEPT,
+                ])
+                .expose_headers([
+                    header::CONTENT_LENGTH,
+                    header::CONTENT_RANGE,
+                    header::ACCEPT_RANGES,
+                    header::CONTENT_TYPE,
+                ]),
+        )
         .with_state(state)
+}
+
+fn is_allowed_cors_origin(origin: &HeaderValue) -> bool {
+    let Ok(raw) = origin.to_str() else {
+        return false;
+    };
+    let Ok(parsed) = url::Url::parse(raw.trim()) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let host_lower = host.to_ascii_lowercase();
+    match parsed.scheme() {
+        "tauri" | "asset" => host_lower == "localhost",
+        "http" | "https" => {
+            host_lower == "localhost"
+                || host_lower == "127.0.0.1"
+                || host_lower == "::1"
+                || host_lower == "[::1]"
+                || host_lower == "tauri.localhost"
+                || host_lower.ends_with(".localhost")
+        }
+        _ => false,
+    }
+}
+
+async fn qq_like_unsupported() -> Response {
+    json_status(
+        StatusCode::NOT_IMPLEMENTED,
+        json!({
+            "ok": false,
+            "unsupported": true,
+            "code": "QQ_LIKE_UNSUPPORTED",
+            "error": "QQ音乐暂不支持接口红心收藏，请前往QQ音乐客户端操作",
+            "message": "QQ音乐暂不支持接口红心收藏，请前往QQ音乐客户端操作",
+        }),
+    )
 }
 
 pub async fn start_local_server(state: Arc<AppBackendState>) -> Result<u16, String> {
@@ -1118,7 +1187,7 @@ async fn listen_report(
 
     let journal_key = format!("{provider}:{session_id}");
     {
-        let journal = state.listen_journal.lock().unwrap();
+        let journal = lock_unpoisoned(&state.listen_journal);
         if let Some(prev) = journal
             .get("entries")
             .and_then(|e| e.get(&journal_key))
@@ -1144,7 +1213,7 @@ async fn listen_report(
     };
     let submitted = res.is_ok();
     {
-        let mut journal = state.listen_journal.lock().unwrap();
+        let mut journal = lock_unpoisoned(&state.listen_journal);
         if let Some(entries) = journal.get_mut("entries").and_then(|e| e.as_object_mut()) {
             entries.insert(
                 journal_key,
@@ -2372,10 +2441,111 @@ async fn qishui_lyric(
 
 // ---------- 代理与本地媒体流 ----------
 
+fn is_forbidden_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            let is_this_net = o[0] == 0;
+            let is_cgnat = o[0] == 100 && (o[1] & 0b1100_0000) == 64;
+            let is_bench = o[0] == 198 && (o[1] == 18 || o[1] == 19);
+            let is_ietf = o[0] == 192 && o[1] == 0 && o[2] == 0;
+            let is_reserved = o[0] >= 240;
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || v4.is_documentation()
+                || is_this_net
+                || is_cgnat
+                || is_bench
+                || is_ietf
+                || is_reserved
+        }
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_forbidden_ip(IpAddr::V4(mapped));
+            }
+            let seg0 = v6.segments()[0];
+            let is_ula = (seg0 & 0xfe00) == 0xfc00;
+            let is_link_local = (seg0 & 0xffc0) == 0xfe80;
+            v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() || is_ula || is_link_local
+        }
+    }
+}
+
+fn validate_external_media_url_syntax(raw_url: &str) -> Result<url::Url, (StatusCode, &'static str)> {
+    let trimmed = raw_url.trim();
+    if trimmed.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "Missing media url"));
+    }
+    let parsed = url::Url::parse(trimmed).map_err(|_| (StatusCode::BAD_REQUEST, "Invalid media url"))?;
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err((StatusCode::BAD_REQUEST, "Invalid url scheme"));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err((StatusCode::BAD_REQUEST, "Credentials in url are not allowed"));
+    }
+    if let Some(port) = parsed.port() {
+        if port != 80 && port != 443 {
+            return Err((StatusCode::FORBIDDEN, "Non-standard port blocked"));
+        }
+    }
+    match parsed.host() {
+        Some(url::Host::Ipv4(v4)) => {
+            if is_forbidden_ip(IpAddr::V4(v4)) {
+                return Err((StatusCode::FORBIDDEN, "Private or loopback ip blocked"));
+            }
+        }
+        Some(url::Host::Ipv6(v6)) => {
+            if is_forbidden_ip(IpAddr::V6(v6)) {
+                return Err((StatusCode::FORBIDDEN, "Private or loopback ip blocked"));
+            }
+        }
+        Some(url::Host::Domain(domain)) => {
+            let clean = domain.trim_end_matches('.').to_ascii_lowercase();
+            if clean.is_empty()
+                || !clean.contains('.')
+                || clean == "localhost"
+                || clean.ends_with(".localhost")
+                || clean.ends_with(".local")
+                || clean.ends_with(".internal")
+                || clean.ends_with(".arpa")
+            {
+                return Err((StatusCode::FORBIDDEN, "Local or internal hostname blocked"));
+            }
+            if let Ok(ip) = clean.parse::<IpAddr>() {
+                if is_forbidden_ip(ip) {
+                    return Err((StatusCode::FORBIDDEN, "Private or loopback ip blocked"));
+                }
+            }
+        }
+        None => return Err((StatusCode::BAD_REQUEST, "Missing host")),
+    }
+    Ok(parsed)
+}
+
+async fn validate_and_resolve_external_url(raw_url: &str) -> Result<url::Url, (StatusCode, &'static str)> {
+    let parsed = validate_external_media_url_syntax(raw_url)?;
+    if let Some(url::Host::Domain(domain)) = parsed.host() {
+        let port = parsed.port_or_known_default().unwrap_or(443);
+        if let Ok(addrs) = tokio::net::lookup_host((domain, port)).await {
+            for addr in addrs {
+                if is_forbidden_ip(addr.ip()) {
+                    return Err((StatusCode::FORBIDDEN, "Resolved private or loopback ip blocked"));
+                }
+            }
+        }
+    }
+    Ok(parsed)
+}
+
 async fn proxy_cover(Query(q): Query<HashMap<String, String>>) -> Response {
     let cover_url = q.get("url").map(String::as_str).unwrap_or("").trim();
-    if !(cover_url.starts_with("http://") || cover_url.starts_with("https://")) {
-        return (StatusCode::BAD_REQUEST, "Invalid cover url").into_response();
+    if let Err((status, msg)) = validate_and_resolve_external_url(cover_url).await {
+        return (status, msg).into_response();
     }
     let resp = match shared_http_client()
         .get(cover_url)
@@ -2387,6 +2557,12 @@ async fn proxy_cover(Query(q): Query<HashMap<String, String>>) -> Response {
         Ok(r) => r,
         Err(e) => return (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
     };
+
+    if let Some(content_len) = resp.content_length() {
+        if content_len > PROXY_COVER_MAX_BYTES {
+            return (StatusCode::PAYLOAD_TOO_LARGE, "Cover image exceeds size limit").into_response();
+        }
+    }
 
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
     let ct = resp
@@ -2405,7 +2581,6 @@ async fn proxy_cover(Query(q): Query<HashMap<String, String>>) -> Response {
     let mut builder = Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, ct)
-        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
         .header("Cross-Origin-Resource-Policy", "cross-origin")
         .header(header::CACHE_CONTROL, "public, max-age=86400");
     if let Some(len) = cl {
@@ -2417,7 +2592,11 @@ async fn proxy_cover(Query(q): Query<HashMap<String, String>>) -> Response {
 }
 
 fn parse_byte_range(range_hdr: &str, total: u64) -> Option<(u64, u64)> {
-    let spec = range_hdr.trim().strip_prefix("bytes=")?;
+    let trimmed = range_hdr.trim();
+    if trimmed.len() < 6 || !trimmed[..6].eq_ignore_ascii_case("bytes=") {
+        return None;
+    }
+    let spec = &trimmed[6..];
     let (s_raw, e_raw) = spec.split_once('-')?;
     if total == 0 {
         return None;
@@ -2456,7 +2635,6 @@ fn send_memory_audio_buffer(buf: Vec<u8>, content_type: &str, range_hdr: Option<
                 .status(StatusCode::PARTIAL_CONTENT)
                 .header(header::CONTENT_TYPE, content_type)
                 .header(header::ACCEPT_RANGES, "bytes")
-                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
                 .header(header::CONTENT_LENGTH, slice.len())
                 .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{total}"))
                 .header(header::CACHE_CONTROL, "no-store")
@@ -2468,7 +2646,6 @@ fn send_memory_audio_buffer(buf: Vec<u8>, content_type: &str, range_hdr: Option<
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
         .header(header::ACCEPT_RANGES, "bytes")
-        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
         .header(header::CONTENT_LENGTH, total)
         .header(header::CACHE_CONTROL, "no-store")
         .body(Body::from(buf))
@@ -2488,34 +2665,83 @@ async fn proxy_audio(
 
     // Qishui encrypted audio stream handling (#auth=spade_a)
     if let Some((clean_url, fragment)) = audio_url.split_once("#auth=") {
-        if let Some((cached, ct)) = state.decrypt_cache.lock().unwrap().get(audio_url) {
+        if let Err((status, msg)) = validate_and_resolve_external_url(clean_url).await {
+            return (status, msg).into_response();
+        }
+        if let Some((cached, ct)) = lock_unpoisoned(&state.decrypt_cache).get(audio_url) {
             return send_memory_audio_buffer(cached, &ct, range_hdr);
         }
         let spade_a = percent_encoding::percent_decode_str(fragment)
             .decode_utf8_lossy()
             .to_string();
-        if let Ok(resp) = shared_http_client()
+        let resp = match shared_http_client()
             .get(clean_url)
             .timeout(std::time::Duration::from_secs(20))
             .send()
             .await
         {
-            if let Ok(bytes) = resp.bytes().await {
-                if let Ok(dec) = decrypt_qishui_track(&bytes, &spade_a) {
-                    let ct = if dec.is_flac { "audio/flac" } else { "audio/mp4" }.to_string();
-                    state
-                        .decrypt_cache
-                        .lock()
-                        .unwrap()
-                        .insert(audio_url.to_string(), dec.buffer.clone(), ct.clone());
-                    return send_memory_audio_buffer(dec.buffer, &ct, range_hdr);
-                }
+            Ok(r) => r,
+            Err(e) => return (StatusCode::BAD_GATEWAY, format!("Encrypted audio fetch failed: {e}")).into_response(),
+        };
+        if !resp.status().is_success() {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("Encrypted audio upstream returned {}", resp.status().as_u16()),
+            )
+                .into_response();
+        }
+        if let Some(len) = resp.content_length() {
+            if len > QISHUI_DECRYPT_CACHE_MAX_BYTES as u64 {
+                return (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "Encrypted audio exceeds max buffer size",
+                )
+                    .into_response();
             }
         }
+        let mut bytes = Vec::with_capacity(
+            resp.content_length()
+                .map(|v| v.min(QISHUI_DECRYPT_CACHE_MAX_BYTES as u64) as usize)
+                .unwrap_or(0),
+        );
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk_res) = futures_util::TryStreamExt::try_next(&mut stream)
+            .await
+            .transpose()
+        {
+            let Ok(chunk) = chunk_res else {
+                return (StatusCode::BAD_GATEWAY, "Encrypted audio stream aborted").into_response();
+            };
+            if bytes.len().saturating_add(chunk.len()) > QISHUI_DECRYPT_CACHE_MAX_BYTES {
+                return (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "Encrypted audio exceeds max buffer size",
+                )
+                    .into_response();
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let dec = match decrypt_qishui_track(&bytes, &spade_a) {
+            Ok(d) => d,
+            Err(e) => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("Encrypted audio decrypt failed: {e}"),
+                )
+                    .into_response();
+            }
+        };
+        let ct = if dec.is_flac { "audio/flac" } else { "audio/mp4" }.to_string();
+        lock_unpoisoned(&state.decrypt_cache).insert(
+            audio_url.to_string(),
+            dec.buffer.clone(),
+            ct.clone(),
+        );
+        return send_memory_audio_buffer(dec.buffer, &ct, range_hdr);
     }
 
-    if !(audio_url.starts_with("http://") || audio_url.starts_with("https://")) {
-        return (StatusCode::BAD_REQUEST, "Invalid audio url").into_response();
+    if let Err((status, msg)) = validate_and_resolve_external_url(audio_url).await {
+        return (status, msg).into_response();
     }
 
     let referer = if audio_url.contains("kugou.com") {
@@ -2561,7 +2787,6 @@ async fn proxy_audio(
     let mut builder = Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, ct)
-        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::CACHE_CONTROL, "no-store");
     if let Some(v) = cl {
@@ -2609,7 +2834,6 @@ pub async fn serve_file_with_range(
             .header(header::CONTENT_LENGTH, len)
             .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{size}"))
             .header(header::ACCEPT_RANGES, "bytes")
-            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
             .header("Cross-Origin-Resource-Policy", "cross-origin")
             .body(Body::from_stream(stream))
             .unwrap();
@@ -2621,7 +2845,6 @@ pub async fn serve_file_with_range(
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CONTENT_LENGTH, size)
         .header(header::ACCEPT_RANGES, "bytes")
-        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
         .header("Cross-Origin-Resource-Policy", "cross-origin")
         .body(Body::from_stream(stream))
         .unwrap()
@@ -2648,8 +2871,10 @@ async fn serve_we_media_resolved(
     cap: &str,
     headers: HeaderMap,
 ) -> Response {
-    let expected = state.wallpaper_engine.list_projects(false).media_token;
-    if cap != expected {
+    let expected = state.wallpaper_engine.media_token();
+    if expected.is_empty()
+        || !crate::desktop::local_library::constant_time_eq(cap.trim(), &expected)
+    {
         return StatusCode::FORBIDDEN.into_response();
     }
     let decoded_rel = percent_encoding::percent_decode_str(rel)
@@ -3317,6 +3542,7 @@ mod tests {
 
         // 路径穿越 -> 404
         let traversal = app
+            .clone()
             .oneshot(
                 Request::get(&format!(
                     "/we-media/file/{id}?path=../secret.mp4&cap={token}"
@@ -3327,5 +3553,98 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(traversal.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn proxy_routes_block_ssrf_and_restrict_cors_and_qq_like() {
+        let (_tmp, state) = test_state();
+        let app = build_router(state);
+
+        for blocked_url in [
+            "http://127.0.0.1:8080/secret",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://localhost/admin",
+            "http://[::1]/local",
+            "http://10.0.0.1/internal",
+            "file:///etc/passwd#auth=abc",
+            "http://127.0.0.1:9000/a.mp3#auth=abc",
+            "https://music.163.com:8443/nonstd.mp3",
+        ] {
+            let encoded = urlencoding_for_test(blocked_url);
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::get(&format!("/api/audio?url={encoded}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                resp.status() == StatusCode::BAD_REQUEST || resp.status() == StatusCode::FORBIDDEN,
+                "expected 400/403 for {blocked_url}, got {}",
+                resp.status()
+            );
+        }
+
+        let cover_ssrf = app
+            .clone()
+            .oneshot(
+                Request::get("/api/cover?url=http%3A%2F%2F169.254.169.254%2Flatest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cover_ssrf.status(), StatusCode::FORBIDDEN);
+
+        // 合法远端 URL 语法允许，但拒绝未授权的第三方 CORS Origin
+        let evil_cors = app
+            .clone()
+            .oneshot(
+                Request::get("/api/app/version")
+                    .header(header::ORIGIN, "https://evil.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(evil_cors
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none());
+
+        let tauri_cors = app
+            .clone()
+            .oneshot(
+                Request::get("/api/app/version")
+                    .header(header::ORIGIN, "http://tauri.localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tauri_cors
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("http://tauri.localhost")
+        );
+
+        let qq_like = app
+            .oneshot(
+                Request::post("/api/qq/like")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(qq_like.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    fn urlencoding_for_test(raw: &str) -> String {
+        percent_encoding::utf8_percent_encode(raw, percent_encoding::NON_ALPHANUMERIC).to_string()
     }
 }

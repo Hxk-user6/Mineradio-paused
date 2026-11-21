@@ -38,6 +38,10 @@ impl Default for PersistedWindowSettings {
     }
 }
 
+pub(crate) fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub struct TauriAppState {
     pub backend: Arc<AppBackendState>,
     pub http_port: AtomicU16,
@@ -49,7 +53,10 @@ pub struct TauriAppState {
     pub desktop_icons_visible: AtomicBool,
     pub global_hotkey_bindings: Mutex<Vec<Value>>,
     pub pointer_route: Mutex<Value>,
+    pub pointer_poll_seq: AtomicU64,
     pub memory_reduct_enabled: AtomicBool,
+    pub memory_reduct_include_system: AtomicBool,
+    pub memory_reduct_purge_mask: AtomicU64,
     pub memory_reduct_interval_sec: AtomicU64,
     pub memory_reduct_task_seq: AtomicU64,
     pub platform_login_seq: AtomicU64,
@@ -78,7 +85,10 @@ impl TauriAppState {
                 "overSoftwareUi": true,
                 "overDesktopControls": false
             })),
+            pointer_poll_seq: AtomicU64::new(0),
             memory_reduct_enabled: AtomicBool::new(false),
+            memory_reduct_include_system: AtomicBool::new(false),
+            memory_reduct_purge_mask: AtomicU64::new(0),
             memory_reduct_interval_sec: AtomicU64::new(60),
             memory_reduct_task_seq: AtomicU64::new(0),
             platform_login_seq: AtomicU64::new(0),
@@ -96,7 +106,7 @@ impl TauriAppState {
 
     pub fn save_close_behavior(&self, behavior: &str) -> String {
         let norm = normalize_close_behavior(behavior);
-        *self.close_behavior.lock().unwrap() = norm.clone();
+        *lock_unpoisoned(&self.close_behavior) = norm.clone();
         let settings_path = self
             .backend
             .config
@@ -135,7 +145,7 @@ pub fn build_window_state_payload(app: &AppHandle, state: &TauriAppState) -> Val
         .and_then(|w| w.is_minimized().ok())
         .unwrap_or(false);
     let wp_status = state.backend.wallpaper_engine.get_wallpaper_mode_status();
-    let close_behavior = state.close_behavior.lock().unwrap().clone();
+    let close_behavior = lock_unpoisoned(&state.close_behavior).clone();
 
     json!({
         "isDesktop": true,
@@ -160,8 +170,39 @@ pub fn get_runtime_endpoints(state: tauri::State<'_, Arc<TauriAppState>>) -> Val
     json!({
         "httpBase": state.http_base(),
         "mediaToken": state.backend.local_library.media_token(),
-        "wallpaperMediaToken": state.backend.wallpaper_engine.list_projects(false).media_token,
+        "wallpaperMediaToken": state.backend.wallpaper_engine.media_token(),
     })
+}
+
+/// 在应用真正退出前执行清理：恢复桌面图标、解除 WorkerW 挂载、关闭鼠标穿透及销毁子窗口。
+pub fn cleanup_before_app_exit(app: &AppHandle, state: &TauriAppState) {
+    state.pointer_poll_seq.fetch_add(1, Ordering::AcqRel);
+    state.platform_login_seq.fetch_add(1, Ordering::AcqRel);
+    state.memory_reduct_enabled.store(false, Ordering::Release);
+    state.memory_reduct_task_seq.fetch_add(1, Ordering::AcqRel);
+    state.desktop_software_locked.store(false, Ordering::Release);
+
+    if !state.desktop_icons_visible.load(Ordering::Acquire) {
+        if win32::set_desktop_icons_visible(true).is_ok() {
+            state.desktop_icons_visible.store(true, Ordering::Release);
+        }
+    }
+
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.set_ignore_cursor_events(false);
+        #[cfg(target_os = "windows")]
+        {
+            if let Ok(hwnd) = win.hwnd() {
+                let _ = win32::set_full_desktop_attached(hwnd.0 as isize, false);
+            }
+        }
+    }
+
+    for label in [DESKTOP_LYRICS_LABEL, PLATFORM_LOGIN_LABEL] {
+        if let Some(child_win) = app.get_webview_window(label) {
+            let _ = child_win.close();
+        }
+    }
 }
 
 // ==================== 窗口控制 ====================
@@ -249,16 +290,9 @@ pub fn desktop_window_close(
     let resolved = behavior
         .as_deref()
         .map(normalize_close_behavior)
-        .unwrap_or_else(|| state.close_behavior.lock().unwrap().clone());
+        .unwrap_or_else(|| lock_unpoisoned(&state.close_behavior).clone());
     if resolved == "quit" {
-        #[cfg(target_os = "windows")]
-        {
-            if let Some(win) = app.get_webview_window("main") {
-                if let Ok(hwnd) = win.hwnd() {
-                    let _ = win32::set_full_desktop_attached(hwnd.0 as isize, false);
-                }
-            }
-        }
+        cleanup_before_app_exit(&app, &state);
         app.exit(0);
         return json!({ "ok": true, "behavior": "quit" });
     }
@@ -280,7 +314,7 @@ pub fn desktop_window_get_state(
 
 #[tauri::command]
 pub fn desktop_window_get_close_behavior(state: tauri::State<'_, Arc<TauriAppState>>) -> Value {
-    let behavior = state.close_behavior.lock().unwrap().clone();
+    let behavior = lock_unpoisoned(&state.close_behavior).clone();
     json!({ "behavior": behavior })
 }
 
@@ -604,6 +638,17 @@ pub fn configure_memory_reduct(
         .or_else(|| cfg.get("auto"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let include_system = cfg
+        .get("includeSystem")
+        .or_else(|| cfg.get("purgeSystem"))
+        .or_else(|| cfg.get("system"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let purge_mask = cfg
+        .get("mask")
+        .and_then(|v| v.as_u64())
+        .map(|v| win32::normalize_memory_mask(Some(v as u32)) as u64)
+        .unwrap_or(win32::MEMORY_MASK_DEFAULT as u64);
     let interval_sec = cfg
         .get("intervalSec")
         .or_else(|| cfg.get("intervalSeconds"))
@@ -632,6 +677,12 @@ pub fn configure_memory_reduct(
 
     state.memory_reduct_enabled.store(enabled, Ordering::Release);
     state
+        .memory_reduct_include_system
+        .store(include_system, Ordering::Release);
+    state
+        .memory_reduct_purge_mask
+        .store(purge_mask, Ordering::Release);
+    state
         .memory_reduct_interval_sec
         .store(interval_sec, Ordering::Release);
     let seq = state.memory_reduct_task_seq.fetch_add(1, Ordering::AcqRel) + 1;
@@ -651,6 +702,17 @@ pub fn configure_memory_reduct(
                     break;
                 }
                 let _ = mem_trim(Some("memory-reduct-timer"));
+                if state_bg
+                    .memory_reduct_include_system
+                    .load(Ordering::Acquire)
+                {
+                    let mask = state_bg.memory_reduct_purge_mask.load(Ordering::Acquire) as u32;
+                    let _ = mem_purge(Some(PurgeSystemMemoryPayload {
+                        mask: Some(mask),
+                        manual: Some(false),
+                        pids: None,
+                    }));
+                }
             }
         });
     }
@@ -660,6 +722,8 @@ pub fn configure_memory_reduct(
         "ok": true,
         "supported": supported,
         "enabled": enabled,
+        "includeSystem": include_system,
+        "mask": purge_mask,
         "intervalSec": interval_sec,
         "config": cfg,
     })
@@ -727,7 +791,7 @@ fn apply_desktop_lyrics_y_position(app: &AppHandle, win: &tauri::WebviewWindow, 
 
 #[tauri::command]
 pub fn desktop_lyrics_get_state(state: tauri::State<'_, Arc<TauriAppState>>) -> Value {
-    let payload = state.desktop_lyrics_payload.lock().unwrap().clone();
+    let payload = lock_unpoisoned(&state.desktop_lyrics_payload).clone();
     json!({
         "ok": true,
         "enabled": state.desktop_lyrics_enabled.load(Ordering::Acquire),
@@ -747,7 +811,7 @@ pub fn set_desktop_lyrics_enabled(
         .desktop_lyrics_enabled
         .store(enabled, Ordering::Release);
     if let Some(ref p) = payload {
-        *state.desktop_lyrics_payload.lock().unwrap() = Some(p.clone());
+        *lock_unpoisoned(&state.desktop_lyrics_payload) = Some(p.clone());
         if let Some(click_through) = p.get("clickThrough").and_then(|v| v.as_bool()) {
             state
                 .desktop_lyrics_locked
@@ -768,7 +832,7 @@ pub fn set_desktop_lyrics_enabled(
                     apply_desktop_lyrics_y_position(&app, &win, y_val);
                 }
                 let _ = win.show();
-                let current_payload = state.desktop_lyrics_payload.lock().unwrap().clone();
+                let current_payload = lock_unpoisoned(&state.desktop_lyrics_payload).clone();
                 if let Some(p) = current_payload {
                     let _ = app.emit("mineradio-desktop-lyrics-state", p);
                 }
@@ -795,7 +859,7 @@ pub fn update_desktop_lyrics(
     payload: Value,
 ) -> Value {
     let merged_payload = {
-        let mut guard = state.desktop_lyrics_payload.lock().unwrap();
+        let mut guard = lock_unpoisoned(&state.desktop_lyrics_payload);
         let next = match (guard.take(), payload.clone()) {
             (Some(Value::Object(mut prev)), Value::Object(patch)) => {
                 for (k, v) in patch {
@@ -1180,6 +1244,15 @@ pub fn set_wallpaper_mode(
 
     match state.backend.wallpaper_engine.set_wallpaper_mode(enabled) {
         Ok(_status) => {
+            if !enabled {
+                state.desktop_software_locked.store(false, Ordering::Release);
+                state.pointer_poll_seq.fetch_add(1, Ordering::AcqRel);
+                if let Some(win) = app.get_webview_window("main") {
+                    let _ = win.set_ignore_cursor_events(false);
+                }
+            } else {
+                sync_main_window_pointer_passthrough(&app, &state);
+            }
             let payload = emit_wallpaper_runtime_state(&app, &state);
             emit_window_state(&app, &state);
             payload
@@ -1217,6 +1290,107 @@ pub fn get_wallpaper_mode_status(state: tauri::State<'_, Arc<TauriAppState>>) ->
     json!(state.backend.wallpaper_engine.get_wallpaper_mode_status())
 }
 
+pub(crate) fn compute_pointer_ignore(
+    wallpaper_enabled: bool,
+    software_locked: bool,
+    route: &Value,
+) -> bool {
+    if !wallpaper_enabled || !software_locked {
+        return false;
+    }
+    let over_controls = route
+        .get("overDesktopControls")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    !over_controls
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn point_in_rect_value(rect: &Value, x: f64, y: f64) -> bool {
+    let Some(obj) = rect.as_object() else {
+        return false;
+    };
+    let (Some(l), Some(t), Some(r), Some(b)) = (
+        obj.get("left").and_then(|v| v.as_f64()),
+        obj.get("top").and_then(|v| v.as_f64()),
+        obj.get("right").and_then(|v| v.as_f64()),
+        obj.get("bottom").and_then(|v| v.as_f64()),
+    ) else {
+        return false;
+    };
+    x >= l && x <= r && y >= t && y <= b
+}
+
+pub fn sync_main_window_pointer_passthrough(app: &AppHandle, state: &TauriAppState) {
+    let wp_enabled = state
+        .backend
+        .wallpaper_engine
+        .get_wallpaper_mode_status()
+        .enabled;
+    let locked = state.desktop_software_locked.load(Ordering::Acquire);
+    let route = lock_unpoisoned(&state.pointer_route).clone();
+    let ignore = compute_pointer_ignore(wp_enabled, locked, &route);
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.set_ignore_cursor_events(ignore);
+    }
+}
+
+fn start_windows_pointer_route_monitor(app: &AppHandle, state: &Arc<TauriAppState>) {
+    let seq = state.pointer_poll_seq.fetch_add(1, Ordering::AcqRel) + 1;
+    #[cfg(target_os = "windows")]
+    {
+        let app_bg = app.clone();
+        let state_bg = state.clone();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                if state_bg.pointer_poll_seq.load(Ordering::Acquire) != seq
+                    || !state_bg.desktop_software_locked.load(Ordering::Acquire)
+                {
+                    break;
+                }
+                let wp_enabled = state_bg
+                    .backend
+                    .wallpaper_engine
+                    .get_wallpaper_mode_status()
+                    .enabled;
+                if !wp_enabled {
+                    if let Some(win) = app_bg.get_webview_window("main") {
+                        let _ = win.set_ignore_cursor_events(false);
+                    }
+                    break;
+                }
+                let Some(win) = app_bg.get_webview_window("main") else {
+                    break;
+                };
+                let Ok(hwnd) = win.hwnd() else {
+                    continue;
+                };
+                if let Some((px, py)) = win32::get_cursor_client_pos(hwnd.0 as isize) {
+                    let scale = win.scale_factor().unwrap_or(1.0).max(0.5);
+                    let lx = (px as f64) / scale;
+                    let ly = (py as f64) / scale;
+                    let route = lock_unpoisoned(&state_bg.pointer_route).clone();
+                    let over_controls = route
+                        .get("controlRect")
+                        .map(|rect| point_in_rect_value(rect, lx, ly))
+                        .unwrap_or_else(|| {
+                            route
+                                .get("overDesktopControls")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false)
+                        });
+                    let _ = win.set_ignore_cursor_events(!over_controls);
+                }
+            }
+        });
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (app, seq);
+    }
+}
+
 #[tauri::command]
 pub fn set_desktop_software_locked(
     app: AppHandle,
@@ -1226,6 +1400,18 @@ pub fn set_desktop_software_locked(
     state
         .desktop_software_locked
         .store(locked, Ordering::Release);
+    sync_main_window_pointer_passthrough(&app, &state);
+    if locked
+        && state
+            .backend
+            .wallpaper_engine
+            .get_wallpaper_mode_status()
+            .enabled
+    {
+        start_windows_pointer_route_monitor(&app, state.inner());
+    } else {
+        state.pointer_poll_seq.fetch_add(1, Ordering::AcqRel);
+    }
     emit_wallpaper_runtime_state(&app, &state);
     emit_window_state(&app, &state);
     json!({ "ok": true, "locked": locked })
@@ -1265,15 +1451,42 @@ pub fn request_desktop_keyboard_focus(app: AppHandle, _reason: Option<String>) -
 
 #[tauri::command]
 pub fn update_desktop_pointer_route(
+    app: AppHandle,
     state: tauri::State<'_, Arc<TauriAppState>>,
     payload: Value,
 ) -> Value {
-    *state.pointer_route.lock().unwrap() = payload;
+    {
+        let mut guard = lock_unpoisoned(&state.pointer_route);
+        if let (Some(prev), Some(patch)) = (guard.as_object_mut(), payload.as_object()) {
+            for (k, v) in patch {
+                prev.insert(k.clone(), v.clone());
+            }
+        } else {
+            *guard = payload;
+        }
+    }
+    sync_main_window_pointer_passthrough(&app, &state);
     json!({ "ok": true })
 }
 
 #[tauri::command]
-pub fn update_desktop_icon_shields(_payload: Value) -> Value {
+pub fn update_desktop_icon_shields(
+    app: AppHandle,
+    state: tauri::State<'_, Arc<TauriAppState>>,
+    payload: Value,
+) -> Value {
+    {
+        let mut guard = lock_unpoisoned(&state.pointer_route);
+        if let Some(obj) = guard.as_object_mut() {
+            if let Some(rect) = payload.get("controlRect") {
+                obj.insert("controlRect".to_string(), rect.clone());
+            }
+            if let Some(over) = payload.get("overDesktopControls") {
+                obj.insert("overDesktopControls".to_string(), over.clone());
+            }
+        }
+    }
+    sync_main_window_pointer_passthrough(&app, &state);
     json!({ "ok": true, "supported": cfg!(target_os = "windows") })
 }
 
@@ -1285,7 +1498,7 @@ pub fn configure_global_hotkeys(
     state: tauri::State<'_, Arc<TauriAppState>>,
     bindings: Vec<Value>,
 ) -> Value {
-    *state.global_hotkey_bindings.lock().unwrap() = bindings.clone();
+    *lock_unpoisoned(&state.global_hotkey_bindings) = bindings.clone();
     let manager = app.global_shortcut();
     let _ = manager.unregister_all();
 
@@ -1601,9 +1814,6 @@ async fn open_platform_login_window_impl(
             "message": "登录入口尚未解锁"
         });
     }
-    if let Some(existing) = app.get_webview_window(PLATFORM_LOGIN_LABEL) {
-        let _ = existing.close();
-    }
     let Ok(parsed) = url::Url::parse(spec.login_url) else {
         return json!({ "ok": false, "error": "INVALID_LOGIN_URL" });
     };
@@ -1612,32 +1822,46 @@ async fn open_platform_login_window_impl(
         clear_backend_provider_session(&state.backend, spec.provider);
     }
 
-    let initial_url = if force_reauth {
-        url::Url::parse("about:blank").unwrap_or_else(|_| parsed.clone())
-    } else {
-        parsed.clone()
-    };
-
-    let win = match WebviewWindowBuilder::new(
-        app,
-        PLATFORM_LOGIN_LABEL,
-        WebviewUrl::External(initial_url),
-    )
-    .title(spec.title)
-    .inner_size(980.0, 680.0)
-    .center()
-    .build()
-    {
-        Ok(w) => w,
-        Err(err) => {
-            return json!({ "ok": false, "error": format!("LOGIN_WINDOW_FAILED:{err}") })
+    let win = if let Some(existing) = app.get_webview_window(PLATFORM_LOGIN_LABEL) {
+        if force_reauth {
+            clear_webview_cookies_for_urls(&existing, spec.cookie_urls);
         }
+        let _ = existing.set_title(spec.title);
+        let _ = existing.navigate(parsed.clone());
+        let _ = existing.show();
+        let _ = existing.set_focus();
+        existing
+    } else {
+        let initial_url = if force_reauth {
+            url::Url::parse("about:blank").unwrap_or_else(|_| parsed.clone())
+        } else {
+            parsed.clone()
+        };
+
+        let created = match WebviewWindowBuilder::new(
+            app,
+            PLATFORM_LOGIN_LABEL,
+            WebviewUrl::External(initial_url),
+        )
+        .title(spec.title)
+        .inner_size(980.0, 680.0)
+        .center()
+        .build()
+        {
+            Ok(w) => w,
+            Err(err) => {
+                return json!({ "ok": false, "error": format!("LOGIN_WINDOW_FAILED:{err}") })
+            }
+        };
+
+        if force_reauth {
+            clear_webview_cookies_for_urls(&created, spec.cookie_urls);
+            let _ = created.navigate(parsed);
+        }
+        created
     };
 
-    if force_reauth {
-        clear_webview_cookies_for_urls(&win, spec.cookie_urls);
-        let _ = win.navigate(parsed);
-    }
+    let _ = &win;
 
     let seq = state.platform_login_seq.fetch_add(1, Ordering::AcqRel) + 1;
     let app_bg = app.clone();
@@ -1782,7 +2006,11 @@ pub async fn clear_platform_login_session(
 }
 
 #[tauri::command]
-pub fn close_platform_login_window(app: AppHandle) -> Value {
+pub fn close_platform_login_window(
+    app: AppHandle,
+    state: tauri::State<'_, Arc<TauriAppState>>,
+) -> Value {
+    state.platform_login_seq.fetch_add(1, Ordering::AcqRel);
     if let Some(win) = app.get_webview_window(PLATFORM_LOGIN_LABEL) {
         let _ = win.close();
     }
@@ -1792,6 +2020,41 @@ pub fn close_platform_login_window(app: AppHandle) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pointer_ignore_and_rect_routing_work() {
+        assert!(!compute_pointer_ignore(false, true, &json!({})));
+        assert!(!compute_pointer_ignore(true, false, &json!({})));
+        assert!(compute_pointer_ignore(
+            true,
+            true,
+            &json!({ "overDesktopControls": false })
+        ));
+        assert!(!compute_pointer_ignore(
+            true,
+            true,
+            &json!({ "overDesktopControls": true })
+        ));
+
+        let rect = json!({ "left": 100.0, "top": 20.0, "right": 300.0, "bottom": 80.0 });
+        assert!(point_in_rect_value(&rect, 150.0, 50.0));
+        assert!(!point_in_rect_value(&rect, 99.0, 50.0));
+        assert!(!point_in_rect_value(&rect, 150.0, 90.0));
+    }
+
+    #[test]
+    fn normalize_close_behavior_maps_exit_and_quit_uniformly() {
+        assert_eq!(normalize_close_behavior("exit"), "quit");
+        assert_eq!(normalize_close_behavior("QUIT"), "quit");
+        assert_eq!(normalize_close_behavior("tray"), "tray");
+        assert_eq!(normalize_close_behavior(""), "tray");
+    }
+
+    #[test]
+    fn desktop_icons_visible_off_windows_reports_visible_true() {
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(win32::set_desktop_icons_visible(false).unwrap(), true);
+    }
 
     #[test]
     fn platform_cookie_detection_and_serialization_work() {
