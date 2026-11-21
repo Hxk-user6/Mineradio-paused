@@ -15,9 +15,12 @@ type DrawerTab = 'queue' | 'playlists' | 'podcast' | 'local';
 
 interface MyPodcast {
   id: string | number;
+  key?: string;
   name: string;
   cover?: string;
   sub?: string;
+  itemType?: string;
+  count?: number;
 }
 
 function pickList(res: Record<string, unknown>, keys: string[]): Array<Record<string, unknown>> {
@@ -66,7 +69,11 @@ export function PlaylistDrawer({
   const [podcastLoading, setPodcastLoading] = useState(false);
   const [openPodcastId, setOpenPodcastId] = useState<string | number | null>(null);
   const [podcastItems, setPodcastItems] = useState<SongRecord[]>([]);
+  const [podcastItemsType, setPodcastItemsType] = useState<'radio' | 'program'>('program');
   const [podcastItemsLoading, setPodcastItemsLoading] = useState(false);
+  const [openRadioId, setOpenRadioId] = useState<string | number | null>(null);
+  const [radioPrograms, setRadioPrograms] = useState<SongRecord[]>([]);
+  const [radioProgramsLoading, setRadioProgramsLoading] = useState(false);
 
   const [activeTab, setActiveTab] = useState<DrawerTab>('queue');
   const [newPlaylistName, setNewPlaylistName] = useState('');
@@ -103,17 +110,33 @@ export function PlaylistDrawer({
     setPodcastLoading(true);
     try {
       const res = await apiJson<Record<string, unknown>>('/api/podcast/my', { timeoutMs: 8000 });
-      const list = pickList(res || {}, ['podcasts', 'radios', 'djRadios', 'list', 'items']);
+      const list = pickList(res || {}, [
+        'collections',
+        'podcasts',
+        'radios',
+        'djRadios',
+        'list',
+        'items',
+      ]);
       setMyPodcasts(
         list
           .map((raw): MyPodcast | null => {
-            const id = (raw.id ?? raw.radioId ?? raw.podcastId) as string | number | undefined;
+            const keyStr = typeof raw.key === 'string' ? raw.key.trim() : '';
+            const id = (keyStr || raw.id || raw.radioId || raw.podcastId) as
+              | string
+              | number
+              | undefined;
             if (id === undefined || id === null || id === '') return null;
+            const countNum =
+              typeof raw.count === 'number' && Number.isFinite(raw.count) ? raw.count : undefined;
             return {
               id,
-              name: String(raw.name || raw.title || '未命名电台'),
+              key: keyStr || undefined,
+              name: String(raw.title || raw.name || '未命名播客分类'),
               cover: String(raw.cover || raw.picUrl || ''),
-              sub: String(raw.dj || raw.artist || raw.desc || raw.description || ''),
+              sub: String(raw.sub || raw.dj || raw.artist || raw.desc || raw.description || ''),
+              itemType: typeof raw.itemType === 'string' ? raw.itemType : undefined,
+              count: countNum,
             };
           })
           .filter((x): x is MyPodcast => Boolean(x))
@@ -130,30 +153,87 @@ export function PlaylistDrawer({
     if (openPodcastId === pod.id) {
       setOpenPodcastId(null);
       setPodcastItems([]);
+      setOpenRadioId(null);
+      setRadioPrograms([]);
       return;
     }
     setOpenPodcastId(pod.id);
     setPodcastItems([]);
+    setOpenRadioId(null);
+    setRadioPrograms([]);
     setPodcastItemsLoading(true);
     try {
-      const res = await apiJson<Record<string, unknown>>(
-        `/api/podcast/my/items?id=${encodeURIComponent(String(pod.id))}`,
-        { timeoutMs: 10000 }
-      );
-      const list = pickList(res || {}, ['programs', 'songs', 'tracks', 'items', 'list']) as unknown as SongRecord[];
+      const queryUrl = pod.key
+        ? `/api/podcast/my/items?key=${encodeURIComponent(pod.key)}&limit=40`
+        : `/api/podcast/my/items?id=${encodeURIComponent(String(pod.id))}&limit=40`;
+      const res = await apiJson<Record<string, unknown>>(queryUrl, { timeoutMs: 10000 });
+      const itemTypeRaw = String(res?.itemType || pod.itemType || '').toLowerCase();
+      setPodcastItemsType(itemTypeRaw === 'radio' ? 'radio' : 'program');
+      const list = pickList(res || {}, [
+        'items',
+        'programs',
+        'songs',
+        'tracks',
+        'list',
+      ]) as unknown as Array<Record<string, unknown>>;
       setPodcastItems(
-        list.map((p) => ({
-          ...p,
-          provider: p.provider || 'netease',
-          type: 'podcast',
-          podcastId: p.podcastId ?? pod.id,
-          cover: p.cover || pod.cover,
-        }))
+        list.map((raw) => {
+          const itemId = (raw.id ?? raw.programId ?? raw.radioId ?? raw.rid) as
+            | string
+            | number
+            | undefined;
+          const isRadio = itemTypeRaw === 'radio';
+          return {
+            ...(raw as Partial<SongRecord>),
+            id: itemId,
+            rid: isRadio ? itemId : undefined,
+            radioId: isRadio ? itemId : undefined,
+            name: String(raw.name || raw.title || '未知节目'),
+            artist: String(raw.artist || raw.djName || pod.name),
+            provider: (raw.provider as SongRecord['provider']) || 'netease',
+            type: isRadio ? 'podcast-radio' : 'podcast',
+            podcastId: (raw.podcastId as string | number | undefined) ?? itemId,
+            cover: String(raw.cover || raw.picUrl || pod.cover || ''),
+          };
+        })
       );
     } catch {
       onToast?.('读取节目失败');
     } finally {
       setPodcastItemsLoading(false);
+    }
+  };
+
+  const toggleCollectionRadio = async (radio: SongRecord) => {
+    const rid = radio.id ?? radio.rid ?? radio.radioId;
+    if (rid === undefined || rid === null) return;
+    if (openRadioId === rid) {
+      setOpenRadioId(null);
+      setRadioPrograms([]);
+      return;
+    }
+    setOpenRadioId(rid);
+    setRadioPrograms([]);
+    setRadioProgramsLoading(true);
+    try {
+      const res = await apiJson<Record<string, unknown>>(
+        `/api/podcast/radio/programs?id=${encodeURIComponent(String(rid))}&limit=30`,
+        { timeoutMs: 10000 }
+      );
+      const list = pickList(res || {}, ['programs', 'songs', 'tracks', 'items', 'list']) as unknown as SongRecord[];
+      setRadioPrograms(
+        list.map((p) => ({
+          ...p,
+          provider: p.provider || 'netease',
+          type: 'podcast',
+          podcastId: p.podcastId ?? rid,
+          cover: p.cover || radio.cover,
+        }))
+      );
+    } catch {
+      onToast?.('读取电台节目失败');
+    } finally {
+      setRadioProgramsLoading(false);
     }
   };
 
@@ -882,7 +962,10 @@ export function PlaylistDrawer({
                     >
                       {pod.cover && <img src={coverProxyUrl(pod.cover)} alt={pod.name} />}
                       <div style={{ minWidth: 0, flex: 1 }}>
-                        <div className="qi-name">{pod.name}</div>
+                        <div className="qi-name">
+                          {pod.name}
+                          {typeof pod.count === 'number' ? ` (${pod.count})` : ''}
+                        </div>
                         <div className="qi-sub">{pod.sub || '播客'}</div>
                       </div>
                     </div>
@@ -893,21 +976,57 @@ export function PlaylistDrawer({
                         ) : podcastItems.length === 0 ? (
                           <div className="qi-sub">暂无节目</div>
                         ) : (
-                          podcastItems.map((item, idx) => (
-                            <div
-                              key={`${songIdentityKey(item)}-${idx}`}
-                              className="queue-item"
-                              onClick={() => {
-                                onSongSelected?.(item);
-                                playSong(idx, podcastItems).catch(() => {});
-                              }}
-                            >
-                              <div className="qi-info">
-                                <div className="qi-name">{item.name || item.title}</div>
-                                <div className="qi-sub">{item.artist || pod.name}</div>
+                          podcastItems.map((item, idx) => {
+                            const isRadio = podcastItemsType === 'radio' || item.type === 'podcast-radio';
+                            const rid = item.id ?? item.rid ?? idx;
+                            return (
+                              <div key={`${songIdentityKey(item)}-${idx}`}>
+                                <div
+                                  className="queue-item"
+                                  onClick={() => {
+                                    if (isRadio) {
+                                      toggleCollectionRadio(item).catch(() => {});
+                                    } else {
+                                      onSongSelected?.(item);
+                                      playSong(idx, podcastItems).catch(() => {});
+                                    }
+                                  }}
+                                >
+                                  <div className="qi-info">
+                                    <div className="qi-name">{item.name || item.title}</div>
+                                    <div className="qi-sub">
+                                      {isRadio ? `${item.artist || pod.name} · 点击展开节目` : item.artist || pod.name}
+                                    </div>
+                                  </div>
+                                </div>
+                                {isRadio && openRadioId === rid && (
+                                  <div style={{ paddingLeft: 12, marginTop: 4, display: 'grid', gap: 4 }}>
+                                    {radioProgramsLoading ? (
+                                      <div className="qi-sub">加载电台节目中...</div>
+                                    ) : radioPrograms.length === 0 ? (
+                                      <div className="qi-sub">该电台暂无可播节目</div>
+                                    ) : (
+                                      radioPrograms.map((prog, pIdx) => (
+                                        <div
+                                          key={`${songIdentityKey(prog)}-${pIdx}`}
+                                          className="queue-item"
+                                          onClick={() => {
+                                            onSongSelected?.(prog);
+                                            playSong(pIdx, radioPrograms).catch(() => {});
+                                          }}
+                                        >
+                                          <div className="qi-info">
+                                            <div className="qi-name">{prog.name || prog.title}</div>
+                                            <div className="qi-sub">{prog.artist || item.name}</div>
+                                          </div>
+                                        </div>
+                                      ))
+                                    )}
+                                  </div>
+                                )}
                               </div>
-                            </div>
-                          ))
+                            );
+                          })
                         )}
                       </div>
                     )}

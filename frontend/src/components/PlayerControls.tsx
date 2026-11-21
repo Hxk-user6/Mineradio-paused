@@ -108,6 +108,7 @@ export function PlayerControls({
   const controlsRootRef = useRef<HTMLDivElement | null>(null);
   const dragRatioRef = useRef<number | null>(null);
   const suppressNextClickRef = useRef(false);
+  const progressDragCleanupRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     const onDocDown = (e: MouseEvent) => {
@@ -120,7 +121,11 @@ export function PlayerControls({
       }
     };
     document.addEventListener('mousedown', onDocDown);
-    return () => document.removeEventListener('mousedown', onDocDown);
+    return () => {
+      document.removeEventListener('mousedown', onDocDown);
+      progressDragCleanupRef.current?.();
+      progressDragCleanupRef.current = null;
+    };
   }, []);
 
   const currentKey = currentSong ? songIdentityKey(currentSong) : '';
@@ -136,31 +141,52 @@ export function PlayerControls({
 
   const handleProgressPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!duration) return;
+    progressDragCleanupRef.current?.();
     suppressNextClickRef.current = true;
     const ratio = computeRatioFromClientX(e.clientX);
     dragRatioRef.current = ratio;
     setDragRatio(ratio);
 
+    let suppressTimer: number | null = null;
     const onMove = (ev: PointerEvent) => {
       const next = computeRatioFromClientX(ev.clientX);
       dragRatioRef.current = next;
       setDragRatio(next);
     };
+    const cleanup = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
+      if (suppressTimer !== null) {
+        window.clearTimeout(suppressTimer);
+        suppressTimer = null;
+      }
+      if (progressDragCleanupRef.current === cleanup) {
+        progressDragCleanupRef.current = null;
+      }
+    };
     const onUp = (ev: PointerEvent) => {
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
       const finalRatio = computeRatioFromClientX(ev.clientX);
       dragRatioRef.current = null;
       setDragRatio(null);
       if (duration > 0) {
         seekTo(finalRatio * duration);
       }
-      window.setTimeout(() => {
+      suppressTimer = window.setTimeout(() => {
         suppressNextClickRef.current = false;
+        suppressTimer = null;
+        if (progressDragCleanupRef.current === cleanup) {
+          progressDragCleanupRef.current = null;
+        }
       }, 150);
     };
+    progressDragCleanupRef.current = cleanup;
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
   };
 
   const displayRatio =
@@ -173,22 +199,15 @@ export function PlayerControls({
 
   const handleToggleLike = async () => {
     if (!currentSong) return;
+    const provider = String(currentSong.provider || currentSong.source || 'netease').toLowerCase();
+    if (provider === 'qq') {
+      onToast?.('QQ 音乐暂不支持红心收藏，请前往 QQ 音乐客户端操作');
+      return;
+    }
     const nextLiked = !isLiked;
     setLikedKeys((prev) => ({ ...prev, [currentKey]: nextLiked }));
     try {
-      const provider = String(currentSong.provider || currentSong.source || 'netease').toLowerCase();
-      if (provider === 'qq') {
-        await apiJson('/api/qq/like', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            id: currentSong.id ?? currentSong.qqId,
-            mid: currentSong.mid ?? currentSong.songmid,
-            like: nextLiked,
-            song: currentSong,
-          }),
-        });
-      } else if (provider === 'kugou') {
+      if (provider === 'kugou') {
         await apiJson('/api/kugou/song/like', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },

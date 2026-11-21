@@ -47,6 +47,63 @@ function formatBytes(bytes?: number): string {
   return `${mb.toFixed(1)} MB`;
 }
 
+export interface WeRootEntry {
+  id?: string;
+  rootId?: string;
+  name?: string;
+  path?: string;
+}
+
+export function extractWeRoots(weRes: Record<string, unknown> | null | undefined): WeRootEntry[] {
+  if (!weRes || typeof weRes !== 'object') return [];
+  const list = Array.isArray(weRes.manualRoots)
+    ? weRes.manualRoots
+    : Array.isArray(weRes.roots)
+    ? weRes.roots
+    : [];
+  return list as WeRootEntry[];
+}
+
+export function resolveWeProjectMediaType(
+  project: { mediaType?: unknown; type?: unknown; file?: unknown },
+  mediaUrl: string
+): 'video' | 'image' {
+  const declared = String(project.mediaType || '').trim().toLowerCase();
+  if (declared === 'video' || declared === 'image') {
+    return declared;
+  }
+  const candidates: string[] = [];
+  if (mediaUrl) {
+    candidates.push(mediaUrl);
+    try {
+      const qIdx = mediaUrl.indexOf('?');
+      if (qIdx >= 0) {
+        const params = new URLSearchParams(mediaUrl.slice(qIdx + 1));
+        const innerPath = params.get('path');
+        if (innerPath) {
+          candidates.push(decodeURIComponent(innerPath));
+        }
+      }
+      candidates.push(decodeURIComponent(mediaUrl));
+    } catch {
+      // ignore malformed uri encoding
+    }
+  }
+  if (project.file) candidates.push(String(project.file));
+  if (candidates.some((c) => /\.(mp4|webm|mov|m4v)(\?|$)/i.test(c))) {
+    return 'video';
+  }
+  if (String(project.type || '').trim().toLowerCase() === 'video') {
+    return 'video';
+  }
+  return 'image';
+}
+
+export function normalizeCloseBehaviorUi(raw: unknown): 'tray' | 'exit' {
+  const s = String(raw || '').trim().toLowerCase();
+  return s === 'exit' || s === 'quit' ? 'exit' : 'tray';
+}
+
 export function FxConsoleModal({ onToast }: FxConsoleModalProps): React.ReactElement {
   const fx = usePlayerStore((s) => s.fx);
   const activePreset = usePlayerStore((s) => s.activePreset);
@@ -83,7 +140,7 @@ export function FxConsoleModal({ onToast }: FxConsoleModalProps): React.ReactEle
   const [cacheSettings, setCacheSettings] = useState<CacheSettings | null>(null);
   const [memorySnapshot, setMemorySnapshot] = useState<MemorySnapshot | null>(null);
   const [weProjects, setWeProjects] = useState<WallpaperEngineProject[]>([]);
-  const [weRoots, setWeRoots] = useState<Array<{ id?: string; rootId?: string; path?: string }>>([]);
+  const [weRoots, setWeRoots] = useState<WeRootEntry[]>([]);
   const [weLoading, setWeLoading] = useState(false);
   const [activeWeId, setActiveWeId] = useState<string>('');
   const [closeBehavior, setCloseBehavior] = useState<'tray' | 'exit'>('tray');
@@ -103,14 +160,14 @@ export function FxConsoleModal({ onToast }: FxConsoleModalProps): React.ReactEle
       desktopWindow.listWallpaperEngineProjects().catch(() => ({
         ok: false,
         projects: [] as WallpaperEngineProject[],
-        roots: [],
+        manualRoots: [] as WeRootEntry[],
       })),
     ]);
     if (cacheRes) setCacheSettings(cacheRes);
     if (memRes) setMemorySnapshot(memRes);
-    setCloseBehavior(closeRes?.behavior === 'exit' ? 'exit' : 'tray');
+    setCloseBehavior(normalizeCloseBehaviorUi(closeRes?.behavior));
     setWeProjects(weRes?.projects || []);
-    setWeRoots((weRes?.roots as Array<{ id?: string; rootId?: string; path?: string }>) || []);
+    setWeRoots(extractWeRoots(weRes as unknown as Record<string, unknown>));
   };
 
   useEffect(() => {
@@ -176,7 +233,7 @@ export function FxConsoleModal({ onToast }: FxConsoleModalProps): React.ReactEle
       if (res.ok && res.path) {
         const list = await desktopWindow.listWallpaperEngineProjects();
         setWeProjects(list.projects || []);
-        setWeRoots((list.roots as Array<{ id?: string; rootId?: string; path?: string }>) || []);
+        setWeRoots(extractWeRoots(list as unknown as Record<string, unknown>));
         onToast?.('已添加 Wallpaper Engine 目录');
       }
     } finally {
@@ -194,7 +251,7 @@ export function FxConsoleModal({ onToast }: FxConsoleModalProps): React.ReactEle
       const mediaUrl = String(project.mediaUrl || project.previewUrl || '');
       if (mediaUrl) {
         setActiveBackgroundMedia({
-          type: /\.(mp4|webm|mov|m4v)(\?|$)/i.test(mediaUrl) ? 'video' : 'image',
+          type: resolveWeProjectMediaType(project, mediaUrl),
           url: mediaUrl,
           muted: true,
           source: 'wallpaper-engine',
@@ -219,13 +276,13 @@ export function FxConsoleModal({ onToast }: FxConsoleModalProps): React.ReactEle
     await desktopWindow.removeWallpaperEngineDirectory(rootId);
     const list = await desktopWindow.listWallpaperEngineProjects();
     setWeProjects(list.projects || []);
-    setWeRoots((list.roots as Array<{ id?: string; rootId?: string; path?: string }>) || []);
+    setWeRoots(extractWeRoots(list as unknown as Record<string, unknown>));
     onToast?.('已移除 Wallpaper Engine 目录');
   };
 
   const handleCloseBehaviorChange = async (behavior: 'tray' | 'exit') => {
     const res = await desktopWindow.setCloseBehavior(behavior);
-    setCloseBehavior(res.behavior === 'exit' ? 'exit' : 'tray');
+    setCloseBehavior(normalizeCloseBehaviorUi(res.behavior));
     onToast?.(behavior === 'exit' ? '关闭按钮行为：直接退出' : '关闭按钮行为：最小化到托盘');
   };
 
@@ -288,7 +345,12 @@ export function FxConsoleModal({ onToast }: FxConsoleModalProps): React.ReactEle
     );
   };
 
-  const colorRow = (field: keyof FxSettings, label: string, fallback: string) => {
+  const colorRow = (
+    field: keyof FxSettings,
+    label: string,
+    fallback: string,
+    modePatch?: Partial<FxSettings>
+  ) => {
     if (!hit(label)) return null;
     const val = String(fx[field] || fallback);
     return (
@@ -299,7 +361,12 @@ export function FxConsoleModal({ onToast }: FxConsoleModalProps): React.ReactEle
           type="color"
           value={/^#[0-9a-f]{6}$/i.test(val) ? val : fallback}
           title={label}
-          onChange={(e) => updateFx({ [field]: e.target.value } as Partial<FxSettings>)}
+          onChange={(e) =>
+            updateFx({
+              ...(modePatch || {}),
+              [field]: e.target.value,
+            } as Partial<FxSettings>)
+          }
         />
         <div className="fx-color-row-label">
           {label}
@@ -1167,70 +1234,87 @@ export function FxConsoleModal({ onToast }: FxConsoleModalProps): React.ReactEle
             {isPreset7 && (
               <div id="fx-preset-7-panel">
                 <div className="fx-section-label">Preset 7 · Sonic Ground</div>
-                {numSlider('sonicGroundAmplitude', '地形振幅', 0, 3, 0.01)}
-                {numSlider('sonicGroundMotionSpeed', '地形流速', 0, 3, 0.01)}
-                {numSlider('sonicGroundDensity', '地形密度', 0.2, 3, 0.01)}
-                {numSlider('sonicGroundRange', '地形范围', 0.2, 3, 0.01)}
-                {numSlider('sonicGroundLower', '地形下沉', -2, 2, 0.01)}
-                {numSlider('sonicGroundDepth', '地形纵深', 0, 3, 0.01)}
-                {numSlider('sonicGroundAutoRotate', '自动旋转', 0, 2, 0.01)}
-                {numSlider('sonicGroundGlow', '地形辉光', 0, 3, 0.01)}
+                {numSlider('sonicGroundAmplitude', '地形振幅', 0, 100, 1, 0)}
+                {numSlider('sonicGroundMotionSpeed', '地形流速', 0, 100, 1, 0)}
+                {numSlider('sonicGroundDensity', '地形密度', 0, 100, 1, 0)}
+                {numSlider('sonicGroundRange', '地形范围', 0, 100, 1, 0)}
+                {numSlider('sonicGroundLower', '歌词避让', 0, 100, 1, 0)}
+                {numSlider('sonicGroundDepth', '地形纵深', 0, 100, 1, 0)}
+                {numSlider('sonicGroundAutoRotate', '自动旋转', 0, 100, 1, 0)}
+                {numSlider('sonicGroundGlow', '地形辉光', 0, 100, 1, 0)}
                 {segRow('sonicGroundColorMode', '地形配色', [
                   { key: 'cover', label: '封面' },
                   { key: 'auto', label: '自动' },
                   { key: 'custom', label: '自定义' },
                 ])}
-                {colorRow('sonicGroundBaseColor', '底色', '#0b1018')}
-                {colorRow('sonicGroundCoolColor', '冷色', '#4ea3ff')}
-                {colorRow('sonicGroundWarmColor', '暖色', '#ff9a5c')}
-                {colorRow('sonicGroundAccentColor', '强调色', '#ffffff')}
+                {colorRow('sonicGroundBaseColor', '底色', '#05070c', { sonicGroundColorMode: 'custom' })}
+                {colorRow('sonicGroundCoolColor', '冷色', '#0066ff', { sonicGroundColorMode: 'custom' })}
+                {colorRow('sonicGroundWarmColor', '暖色', '#ff3c19', { sonicGroundColorMode: 'custom' })}
+                {colorRow('sonicGroundAccentColor', '强调色', '#33e6ff', { sonicGroundColorMode: 'custom' })}
                 <div className="fx-section-label">频段增益</div>
-                {numSlider('sonicGroundSubBass', 'Sub Bass', 0, 3, 0.01)}
-                {numSlider('sonicGroundBass', 'Bass', 0, 3, 0.01)}
-                {numSlider('sonicGroundLowMid', 'Low Mid', 0, 3, 0.01)}
-                {numSlider('sonicGroundMid', 'Mid', 0, 3, 0.01)}
-                {numSlider('sonicGroundHighMid', 'High Mid', 0, 3, 0.01)}
-                {numSlider('sonicGroundPresence', 'Presence', 0, 3, 0.01)}
-                {numSlider('sonicGroundBrilliance', 'Brilliance', 0, 3, 0.01)}
-                {numSlider('sonicGroundAir', 'Air', 0, 3, 0.01)}
+                {numSlider('sonicGroundSubBass', 'Sub Bass', 0, 100, 1, 0)}
+                {numSlider('sonicGroundBass', 'Bass', 0, 100, 1, 0)}
+                {numSlider('sonicGroundLowMid', 'Low Mid', 0, 100, 1, 0)}
+                {numSlider('sonicGroundMid', 'Mid', 0, 100, 1, 0)}
+                {numSlider('sonicGroundHighMid', 'High Mid', 0, 100, 1, 0)}
+                {numSlider('sonicGroundPresence', 'Presence', 0, 100, 1, 0)}
+                {numSlider('sonicGroundBrilliance', 'Brilliance', 0, 100, 1, 0)}
+                {numSlider('sonicGroundAir', 'Air', 0, 100, 1, 0)}
                 <div className="fx-section-label">浮游粒子</div>
                 <div className="fx-toggle-grid">{boolToggle('sonicGroundFloatingEnabled', '启用浮游粒子')}</div>
-                {numSlider('sonicGroundFloatingIntensity', '浮游强度', 0, 3, 0.01)}
-                {numSlider('sonicGroundFloatingMinSize', '浮游最小尺寸', 0.1, 4, 0.01)}
-                {numSlider('sonicGroundFloatingMaxSize', '浮游最大尺寸', 0.1, 8, 0.01)}
-                {numSlider('sonicGroundFloatingSpeed', '浮游速度', 0, 3, 0.01)}
-                {numSlider('sonicGroundFloatingCount', '浮游数量', 0, 2000, 10, 0)}
+                {numSlider('sonicGroundFloatingIntensity', '浮游强度', 0, 100, 1, 0)}
+                {numSlider('sonicGroundFloatingMinSize', '浮游最小尺寸', 0, 100, 1, 0)}
+                {numSlider('sonicGroundFloatingMaxSize', '浮游最大尺寸', 0, 100, 1, 0)}
+                {numSlider('sonicGroundFloatingSpeed', '浮游速度', 0, 100, 1, 0)}
+                {numSlider('sonicGroundFloatingCount', '浮游数量', 0, 100, 1, 0)}
                 <div className="fx-section-label">音频监听</div>
                 <div className="fx-toggle-grid">
                   {boolToggle('sonicAudioMonitorEnabled', '音频监听')}
                   {boolToggle('sonicAudioAutoTrack', '自动跟踪')}
                 </div>
-                {numSlider('sonicAudioSensitivity', '监听灵敏度', 0, 3, 0.01)}
-                {numSlider('sonicAudioBandStart', '频段起点', 0, 1, 0.01)}
-                {numSlider('sonicAudioBandEnd', '频段终点', 0, 1, 0.01)}
-                {numSlider('sonicAudioThreshold', '触发阈值', 0, 1, 0.01)}
-                {numSlider('sonicAudioPulseStrength', '脉冲强度', 0, 3, 0.01)}
+                {numSlider('sonicAudioSensitivity', '监听灵敏度', 0, 100, 1, 0)}
+                {numSlider('sonicAudioBandStart', '频段起点', 0, 510, 1, 0)}
+                {numSlider('sonicAudioBandEnd', '频段终点', 2, 512, 1, 0)}
+                {numSlider('sonicAudioThreshold', '触发阈值', 0, 100, 1, 0)}
+                {numSlider('sonicAudioPulseStrength', '脉冲强度', 0, 100, 1, 0)}
               </div>
             )}
 
             {isPreset8 && (
               <div id="fx-preset-8-panel">
                 <div className="fx-section-label">Preset 8 · Sonic Workshop</div>
-                {numSlider('sonicWorkshopInputGain', '输入增益', 0, 4, 0.01)}
-                {numSlider('sonicWorkshopAudioIntensity', '音频强度', 0, 3, 0.01)}
-                {numSlider('sonicWorkshopResponseRange', '响应范围', 0, 3, 0.01)}
-                {numSlider('sonicWorkshopPeakIntensity', '峰值强度', 0, 3, 0.01)}
+                {numSlider('sonicWorkshopInputGain', '输入压制', 40, 100, 1, 0)}
+                {numSlider('sonicWorkshopAudioIntensity', '音频强度', 0.3, 2.5, 0.01)}
+                {numSlider('sonicWorkshopResponseRange', '响应范围', 0.3, 2, 0.01)}
+                {numSlider('sonicWorkshopPeakIntensity', '峰值强度', 0, 1.4, 0.01)}
                 {segRow('sonicWorkshopColorMode', '配色模式', [
                   { key: 'theme', label: '主题' },
                   { key: 'cover', label: '封面' },
                   { key: 'custom', label: '自定义' },
                 ])}
-                {colorRow('sonicWorkshopCustomColor', '自定义主色', '#7ec8d8')}
-                {colorRow('sonicWorkshopBaseColor', '基础色', '#0b1018')}
-                {colorRow('sonicWorkshopWarmColor', '暖色', '#ff9a5c')}
-                {colorRow('sonicWorkshopCoolColor', '冷色', '#4ea3ff')}
-                {colorRow('sonicWorkshopRippleColor', '涟漪色', '#ffffff')}
-                {colorRow('sonicWorkshopPeakColor', '峰值色', '#ffe08a')}
+                {colorRow('sonicWorkshopCustomColor', '自定义主色', '#d9dde3', {
+                  sonicWorkshopColorMode: 'custom',
+                })}
+                {colorRow('sonicWorkshopBaseColor', '基础色', '#0b0c0e', {
+                  sonicWorkshopColorMode: 'custom',
+                  sonicWorkshopBaseColorMode: 'custom',
+                })}
+                {colorRow('sonicWorkshopWarmColor', '暖色', '#d9dde3', {
+                  sonicWorkshopColorMode: 'custom',
+                  sonicWorkshopWarmColorMode: 'custom',
+                })}
+                {colorRow('sonicWorkshopCoolColor', '冷色', '#ffffff', {
+                  sonicWorkshopColorMode: 'custom',
+                  sonicWorkshopCoolColorMode: 'custom',
+                })}
+                {colorRow('sonicWorkshopRippleColor', '涟漪色', '#ffffff', {
+                  sonicWorkshopColorMode: 'custom',
+                  sonicWorkshopRippleColorMode: 'custom',
+                })}
+                {colorRow('sonicWorkshopPeakColor', '峰值色', '#f2f5f8', {
+                  sonicWorkshopColorMode: 'custom',
+                  sonicWorkshopPeakColorMode: 'custom',
+                })}
               </div>
             )}
 
@@ -1644,7 +1728,7 @@ export function FxConsoleModal({ onToast }: FxConsoleModalProps): React.ReactEle
                         }}
                       >
                         <code className="cache-storage-path small" style={{ flex: 1, margin: 0 }}>
-                          {root.path || rId}
+                          {root.name || root.path || rId}
                         </code>
                         {rId && (
                           <button

@@ -25,7 +25,7 @@ interface GuideStepSpec {
 
 const SIMPLE_GUIDE_STEPS: GuideStepSpec[] = [
   {
-    selector: '#search-wrap',
+    selector: '#search-area',
     kicker: 'Simple 1 / 6 · Search & Import',
     title: '跨平台搜歌与本地曲库',
     body: '顶部搜索框支持 All / 网易云 / QQ / 酷狗 / 汽水 / 播客检索，右侧按钮可快速导入本地音乐或自定义封面。',
@@ -55,7 +55,7 @@ const SIMPLE_GUIDE_STEPS: GuideStepSpec[] = [
     body: '支持舞台粒子歌词开关、0.1s 精度时间轴校准，以及独立置顶穿透的桌面歌词窗口。',
   },
   {
-    selector: '#diy-player-toggle-btn',
+    selector: '#diy-mode-btn',
     kicker: 'Simple 6 / 6 · Mode Switch',
     title: '切换 DIY 深度定制模式',
     body: '点击顶部 DIY 按钮即可解锁 13 套视觉预设、3D 歌单架、手势控制与壁纸引擎等高级创作工具。',
@@ -94,7 +94,7 @@ const DIY_GUIDE_STEPS: GuideStepSpec[] = [
     body: '一键进入纯净视觉舞台或收起底部控制台，配合自定义视频/Wallpaper Engine 背景打造专属视听空间。',
   },
   {
-    selector: '#account-chip',
+    selector: '#user-btn',
     kicker: 'DIY 6 / 6 · Multi-Platform & Hotkeys',
     title: '多平台账号与全局热键',
     body: '管理多平台登录状态与歌单同步，并在 FX 系统页配置全局快捷键与摄像头隔空手势。',
@@ -108,6 +108,7 @@ export function App(): React.ReactElement {
   const duration = usePlayerStore((s) => s.duration);
   const lyrics = usePlayerStore((s) => s.lyrics);
   const activeLyricIdx = usePlayerStore((s) => s.activeLyricIdx);
+  const lyricOffsetSec = usePlayerStore((s) => s.lyricOffsetSec);
   const desktopLyricsEnabled = usePlayerStore((s) => s.desktopLyricsEnabled);
   const diyMode = usePlayerStore((s) => s.diyMode);
   const splashDone = usePlayerStore((s) => s.splashDone);
@@ -131,10 +132,12 @@ export function App(): React.ReactElement {
   const importLocalFiles = usePlayerStore((s) => s.importLocalFiles);
   const playSong = usePlayerStore((s) => s.playSong);
   const updateFx = usePlayerStore((s) => s.updateFx);
+  const setActiveBackgroundMedia = usePlayerStore((s) => s.setActiveBackgroundMedia);
 
   const canvasContainerRef = useRef<HTMLDivElement | null>(null);
   const customBgVideoRef = useRef<HTMLVideoElement | null>(null);
   const weVideoRef = useRef<HTMLVideoElement | null>(null);
+  const droppedBgBlobUrlRef = useRef<string>('');
   const lastDesktopPushAtRef = useRef(0);
   const lastDesktopKeyRef = useRef('');
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -296,9 +299,23 @@ export function App(): React.ReactElement {
     };
   }, []);
 
-  // 当 gestureEnabled 变化时启停 gestureEngine 并绑定动作与旋转回调
+  // 当 gestureEnabled 变化时启停 gestureEngine 并统一绑定完整状态与动作回调
   useEffect(() => {
     gestureEngine.setCallbacks({
+      onStatusChange: (gestureStatus, gestureHint = '') => {
+        usePlayerStore.setState({
+          gestureEnabled: gestureStatus === 'active' || gestureStatus === 'starting',
+          gestureStatus,
+          gestureHint,
+        });
+      },
+      onError: (err) => {
+        usePlayerStore.setState({
+          gestureEnabled: false,
+          gestureStatus: 'error',
+          gestureHint: err,
+        });
+      },
       onPlayPause: () => {
         if (usePlayerStore.getState().fx.gesturePlayerActions === false) return;
         usePlayerStore.getState().togglePlay().catch(() => {});
@@ -331,6 +348,16 @@ export function App(): React.ReactElement {
     }
   }, [gestureEnabled]);
 
+  // 卸载时释放通过拖放创建的临时 blob: URL
+  useEffect(() => {
+    return () => {
+      if (droppedBgBlobUrlRef.current && typeof URL !== 'undefined' && typeof URL.revokeObjectURL === 'function') {
+        URL.revokeObjectURL(droppedBgBlobUrlRef.current);
+        droppedBgBlobUrlRef.current = '';
+      }
+    };
+  }, []);
+
   // 消费 store activeBackgroundMedia，通过 resolveMediaUrl 驱动 #custom-bg-video 与 #wallpaper-engine-layer
   const resolvedBgMediaUrl =
     activeBackgroundMedia?.url && activeBackgroundMedia.type !== 'none'
@@ -347,7 +374,7 @@ export function App(): React.ReactElement {
   const weVideoUrl =
     isWeBackground && activeBackgroundMedia?.type === 'video' ? resolvedBgMediaUrl : '';
   const weImageUrl =
-    activeBackgroundMedia?.type === 'image' ? resolvedBgMediaUrl : '';
+    isWeBackground && activeBackgroundMedia?.type === 'image' ? resolvedBgMediaUrl : '';
   const customBgImageUrl =
     !isWeBackground && activeBackgroundMedia?.type === 'image' && resolvedBgMediaUrl
       ? resolvedBgMediaUrl
@@ -521,18 +548,19 @@ export function App(): React.ReactElement {
   // 同步桌面歌词悬浮窗状态
   useEffect(() => {
     if (!desktopLyricsEnabled) return;
+    const effectiveTime = Math.max(0, currentTime + lyricOffsetSec);
     const line = activeLyricIdx >= 0 ? lyrics[activeLyricIdx] : lyrics[0];
     const nextLine = activeLyricIdx >= 0 ? lyrics[activeLyricIdx + 1] : lyrics[1];
-    const nextTime = nextLine ? nextLine.time : duration || currentTime + 4;
+    const nextTime = nextLine ? nextLine.time : duration || effectiveTime + 4;
     const startTime = line ? line.time : 0;
     const span = Math.max(0.5, nextTime - startTime);
     const progress = line
-      ? Math.max(0, Math.min(1, (currentTime - startTime) / span))
+      ? Math.max(0, Math.min(1, (effectiveTime - startTime) / span))
       : duration > 0
-      ? Math.max(0, Math.min(1, currentTime / duration))
+      ? Math.max(0, Math.min(1, effectiveTime / duration))
       : 0;
 
-    const stateKey = `${currentSong?.name || ''}|${activeLyricIdx}|${playing}|${line?.text || ''}`;
+    const stateKey = `${currentSong?.name || ''}|${activeLyricIdx}|${playing}|${line?.text || ''}|${lyricOffsetSec}`;
     const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
     if (stateKey === lastDesktopKeyRef.current && now - lastDesktopPushAtRef.current < 220) {
       return;
@@ -548,7 +576,7 @@ export function App(): React.ReactElement {
         translation: line?.translation || '',
         nextLine: nextLine?.text || '',
         playing,
-        currentTime,
+        currentTime: effectiveTime,
         duration,
         progress,
         size: fx.desktopLyricsSize,
@@ -566,6 +594,7 @@ export function App(): React.ReactElement {
     lyrics,
     activeLyricIdx,
     currentTime,
+    lyricOffsetSec,
     duration,
     playing,
     fx.desktopLyricsSize,
@@ -634,14 +663,49 @@ export function App(): React.ReactElement {
 
     if (imageFiles.length > 0) {
       const imgFile = imageFiles[0];
+      if (
+        droppedBgBlobUrlRef.current &&
+        typeof URL !== 'undefined' &&
+        typeof URL.revokeObjectURL === 'function'
+      ) {
+        URL.revokeObjectURL(droppedBgBlobUrlRef.current);
+        droppedBgBlobUrlRef.current = '';
+      }
+
+      // 小图片优先转为可持久化的 Data URL；大图则仅在当前会话挂载 blob: 而不持久化进 fx.backgroundImage
+      const canPersistAsDataUrl = imgFile.size <= 3 * 1024 * 1024 && typeof FileReader !== 'undefined';
+      if (canPersistAsDataUrl) {
+        const dataUrl = await new Promise<string>((resolve) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : '');
+          reader.onerror = () => resolve('');
+          reader.readAsDataURL(imgFile);
+        });
+        if (dataUrl) {
+          visualEngine.setCover(dataUrl);
+          updateFx({ backgroundImage: dataUrl });
+          setActiveBackgroundMedia(null);
+          showToast(`已更换封面与背景图片：${imgFile.name}`);
+          return;
+        }
+      }
+
       const imgUrl =
         typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function'
           ? URL.createObjectURL(imgFile)
           : '';
       if (imgUrl) {
+        droppedBgBlobUrlRef.current = imgUrl;
         visualEngine.setCover(imgUrl);
-        updateFx({ backgroundImage: imgUrl });
-        showToast(`已更换封面与背景图片：${imgFile.name}`);
+        if (fx.backgroundImage?.startsWith('blob:')) {
+          updateFx({ backgroundImage: '' });
+        }
+        setActiveBackgroundMedia({
+          type: 'image',
+          url: imgUrl,
+          muted: true,
+        });
+        showToast(`已临时更换封面与背景图片：${imgFile.name}`);
       }
     }
   };

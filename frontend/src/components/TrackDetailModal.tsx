@@ -113,7 +113,7 @@ export const TrackDetailModal: React.FC<TrackDetailModalProps> = ({ onToast }) =
         prov === 'qq'
           ? `/api/qq/song/comments?id=${encodeURIComponent(idVal)}&mid=${encodeURIComponent(idVal)}`
           : prov === 'qishui'
-          ? `/api/qishui/comments?id=${encodeURIComponent(idVal)}`
+          ? `/api/qishui/song/comments?id=${encodeURIComponent(idVal)}`
           : `/api/song/comments?id=${encodeURIComponent(String(song.id || idVal))}`;
 
       const res = await apiJson<{
@@ -171,7 +171,7 @@ export const TrackDetailModal: React.FC<TrackDetailModalProps> = ({ onToast }) =
         provider === 'qq'
           ? '/api/qq/song/comments'
           : provider === 'qishui'
-          ? '/api/qishui/comments'
+          ? '/api/qishui/song/comments'
           : '/api/song/comments';
 
       await apiJson(endpoint, {

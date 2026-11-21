@@ -3,7 +3,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from './App';
 import { DesktopLyricsApp } from './DesktopLyricsApp';
 import { AccountAndLoginModal } from './components/AccountAndLoginModal';
-import { FxConsoleModal } from './components/FxConsoleModal';
+import {
+  FxConsoleModal,
+  extractWeRoots,
+  resolveWeProjectMediaType,
+} from './components/FxConsoleModal';
+import { PlayerControls } from './components/PlayerControls';
+import { PlaylistDrawer } from './components/PlaylistDrawer';
 import { SearchBar } from './components/SearchBar';
 import { TrackDetailModal } from './components/TrackDetailModal';
 import { desktopWindow, emitLocalEvent } from './bridge/tauriBridge';
@@ -245,7 +251,7 @@ describe('Mineradio UI & Desktop Lyrics', () => {
     });
     expect(container.querySelector('#fx-preset-8-panel')).not.toBeNull();
     expect(screen.getByText('Preset 8 · Sonic Workshop')).toBeTruthy();
-    expect(screen.getByText('输入增益')).toBeTruthy();
+    expect(screen.getByText('输入压制')).toBeTruthy();
 
     // 切换到“系统”页签验证缓存与内存诊断字段显示
     fireEvent.click(screen.getByRole('tab', { name: '系统' }));
@@ -444,5 +450,155 @@ describe('Mineradio UI & Desktop Lyrics', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('FxConsoleModal 正确解析 WE manualRoots / %2Emp4 视频、Preset 7/8 量程与 closeBehavior', async () => {
+    expect(extractWeRoots({ manualRoots: [{ id: 'r1', name: 'Workshop' }] })).toEqual([
+      { id: 'r1', name: 'Workshop' },
+    ]);
+    expect(
+      resolveWeProjectMediaType(
+        { type: 'scene', file: 'scene.pkg' },
+        'mineradio-wallpaper://media/abc123?path=sub%2Floop%2Emp4&cap=tok1'
+      )
+    ).toBe('video');
+
+    vi.spyOn(desktopWindow, 'getCloseBehavior').mockResolvedValue({ behavior: 'quit' });
+    vi.spyOn(desktopWindow, 'listWallpaperEngineProjects').mockResolvedValue({
+      ok: true,
+      projects: [],
+      manualRoots: [{ id: 'r-manual', name: '我的壁纸目录' }],
+    } as never);
+
+    usePlayerStore.setState({
+      fxPanelOpen: true,
+      activePreset: 7,
+      fx: { ...DEFAULT_FX_SETTINGS, preset: 7, sonicGroundColorMode: 'cover' },
+    });
+
+    const { container } = render(<FxConsoleModal />);
+
+    // 切换到动效 Tab 检查 Preset 7 滑块量程与选色自动切到 custom
+    fireEvent.click(screen.getByRole('tab', { name: '动效' }));
+    const ampSlider = container.querySelector('#fx-sonicGroundAmplitude') as HTMLInputElement;
+    expect(ampSlider.min).toBe('0');
+    expect(ampSlider.max).toBe('100');
+
+    const baseColorPicker = container.querySelector('#fx-sonicGroundBaseColor') as HTMLInputElement;
+    fireEvent.change(baseColorPicker, { target: { value: '#123456' } });
+    expect(usePlayerStore.getState().fx.sonicGroundColorMode).toBe('custom');
+
+    // Preset 8 输入压制量程验证
+    act(() => {
+      usePlayerStore.setState({
+        activePreset: 8,
+        fx: { ...DEFAULT_FX_SETTINGS, preset: 8 },
+      });
+    });
+    const wsGain = container.querySelector('#fx-sonicWorkshopInputGain') as HTMLInputElement;
+    expect(wsGain.min).toBe('40');
+    expect(wsGain.max).toBe('100');
+
+    // 切换到系统 Tab 验证 closeBehavior 'quit' 回显与 manualRoots 显示
+    fireEvent.click(screen.getByRole('tab', { name: '系统' }));
+    await waitFor(() => {
+      expect(screen.getByText('我的壁纸目录')).toBeTruthy();
+      expect(screen.getByRole('button', { name: '直接退出' }).className).toContain('active');
+    });
+  });
+
+  it('TrackDetailModal 汽水评论使用 /api/qishui/song/comments 契约端点', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes('/api/qishui/song/comments')) {
+        return new Response(
+          JSON.stringify({
+            comments: [{ commentId: 'c1', content: '汽水热评', user: { nickname: '听众A' } }],
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+
+    usePlayerStore.setState({
+      trackDetailOpen: true,
+      currentSong: { id: 'qs-1', name: '汽水测试', provider: 'qishui', source: 'qishui' },
+    });
+
+    render(<TrackDetailModal />);
+
+    await waitFor(() => {
+      expect(screen.getByText('汽水热评')).toBeTruthy();
+    });
+    expect(
+      fetchMock.mock.calls.some(([u]) => String(u).includes('/api/qishui/song/comments?id=qs-1'))
+    ).toBe(true);
+  });
+
+  it('PlaylistDrawer 我的播客读取 collections 并通过 ?key= 拉取节目', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes('/api/podcast/my/items')) {
+        return new Response(
+          JSON.stringify({
+            itemType: 'program',
+            items: [{ id: 'prog-1', name: '第一期节目', artist: '主播X' }],
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes('/api/podcast/my')) {
+        return new Response(
+          JSON.stringify({
+            loggedIn: true,
+            collections: [{ key: 'collect', title: '我订阅的播客', sub: '2个电台', count: 2 }],
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+
+    usePlayerStore.setState({ playlistPanelOpen: true });
+    render(<PlaylistDrawer />);
+
+    fireEvent.click(screen.getByRole('tab', { name: '我的播客' }));
+    await waitFor(() => {
+      expect(screen.getByText(/我订阅的播客/)).toBeTruthy();
+    });
+
+    fireEvent.click(screen.getByText(/我订阅的播客/));
+    await waitFor(() => {
+      expect(screen.getByText('第一期节目')).toBeTruthy();
+    });
+    expect(
+      fetchMock.mock.calls.some(([u]) => String(u).includes('/api/podcast/my/items?key=collect'))
+    ).toBe(true);
+  });
+
+  it('AccountAndLoginModal 在 QQ 标签下可正常收起 Cookie 面板且 QQ 红心点赞明确提示不支持', async () => {
+    usePlayerStore.setState({ easterEggUnlocked: true });
+    const { container } = render(<AccountAndLoginModal loginModalOpen={true} />);
+
+    fireEvent.click(container.querySelector('#login-provider-qq') as HTMLButtonElement);
+    const cookiePanel = container.querySelector('#qq-cookie-panel') as HTMLElement;
+    expect(cookiePanel.className).toContain('show');
+
+    fireEvent.click(container.querySelector('#qq-cookie-toggle-btn') as HTMLButtonElement);
+    expect(cookiePanel.className).not.toContain('show');
+
+    cleanup();
+
+    const onToast = vi.fn();
+    usePlayerStore.setState({
+      currentSong: { id: 'qq-1', mid: 'mid-1', name: 'QQ歌', provider: 'qq', source: 'qq' },
+    });
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    const { container: ctrlContainer } = render(<PlayerControls onToast={onToast} />);
+    const likeBtn = ctrlContainer.querySelector('#heart-btn') as HTMLButtonElement;
+    fireEvent.click(likeBtn);
+    expect(onToast).toHaveBeenCalledWith('QQ 音乐暂不支持红心收藏，请前往 QQ 音乐客户端操作');
+    expect(fetchSpy.mock.calls.some(([u]) => String(u).includes('/api/qq/like'))).toBe(false);
   });
 });

@@ -94,10 +94,15 @@ export function AccountAndLoginModal({
   const [selectedPageIdx, setSelectedPageIdx] = useState(0);
 
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const switchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pollTokenRef = useRef(0);
 
   const stopPolling = useCallback(() => {
     pollTokenRef.current += 1;
+    if (switchTimerRef.current) {
+      clearTimeout(switchTimerRef.current);
+      switchTimerRef.current = null;
+    }
     if (pollTimerRef.current) {
       clearTimeout(pollTimerRef.current);
       clearInterval(pollTimerRef.current);
@@ -297,6 +302,7 @@ export function AccountAndLoginModal({
           setQrStateClass('scan');
           refreshLoginStatuses().catch(() => {});
           refreshAllUserPlaylists().catch(() => {});
+          refreshHomeDiscover().catch(() => {});
           onToast?.(`汽水音乐已登录${res.nickname ? `：${res.nickname}` : ''}`);
           closeLogin();
           return;
@@ -769,7 +775,8 @@ export function AccountAndLoginModal({
                           );
                           setQrStateClass(loggedIn ? 'scan' : '');
                           if (!loggedIn && (p.key === 'netease' || p.key === 'qishui')) {
-                            setTimeout(() => {
+                            switchTimerRef.current = setTimeout(() => {
+                              switchTimerRef.current = null;
                               startProviderLogin(p.key).catch(() => {});
                             }, 30);
                           }
@@ -873,9 +880,7 @@ export function AccountAndLoginModal({
 
                   <div
                     id="qq-cookie-panel"
-                    className={`qq-cookie-panel${
-                      cookieOpen || provider === 'qq' || provider === 'kugou' ? ' show' : ''
-                    }`}
+                    className={`qq-cookie-panel${cookieOpen ? ' show' : ''}`}
                   >
                     <textarea
                       id="qq-cookie-input"

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { desktopWindow } from '../bridge/tauriBridge';
 import { usePlayerStore } from '../store/playerStore';
 
@@ -10,10 +10,28 @@ export function DesktopModeDock({ onToast }: DesktopModeDockProps): React.ReactE
   const fx = usePlayerStore((s) => s.fx);
   const updateFx = usePlayerStore((s) => s.updateFx);
 
+  const dockRef = useRef<HTMLDivElement | null>(null);
   const [dockOpen, setDockOpen] = useState(false);
+  const [overControls, setOverControls] = useState(false);
   const [wallpaperEnabled, setWallpaperEnabled] = useState(Boolean(fx.wallpaperMode));
   const [softwareLocked, setSoftwareLocked] = useState(false);
   const [iconsVisible, setIconsVisible] = useState(true);
+
+  const syncControlShields = useCallback((isOver: boolean) => {
+    const el = dockRef.current;
+    if (!el || typeof el.getBoundingClientRect !== 'function') return;
+    const rect = el.getBoundingClientRect();
+    const controlRect = {
+      left: rect.left,
+      top: rect.top,
+      right: rect.right,
+      bottom: rect.bottom,
+    };
+    desktopWindow.updateDesktopIconShields({
+      controlRect,
+      overDesktopControls: isOver,
+    }).catch(() => {});
+  }, []);
 
   useEffect(() => {
     setWallpaperEnabled(Boolean(fx.wallpaperMode));
@@ -101,7 +119,15 @@ export function DesktopModeDock({ onToast }: DesktopModeDockProps): React.ReactE
     document.body.classList.toggle('desktop-mode-controls-open', dockOpen);
     document.body.classList.toggle('desktop-software-locked', softwareLocked);
     document.body.classList.toggle('desktop-icons-hidden', !iconsVisible);
-  }, [wallpaperEnabled, dockOpen, softwareLocked, iconsVisible]);
+    syncControlShields(overControls);
+  }, [wallpaperEnabled, dockOpen, softwareLocked, iconsVisible, overControls, syncControlShields]);
+
+  useEffect(() => {
+    if (!wallpaperEnabled || typeof window === 'undefined') return;
+    const onResize = () => syncControlShields(overControls);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, [wallpaperEnabled, overControls, syncControlShields]);
 
   const handleToggleWallpaperMode = async () => {
     const next = !wallpaperEnabled;
@@ -137,9 +163,28 @@ export function DesktopModeDock({ onToast }: DesktopModeDockProps): React.ReactE
 
   return (
     <div
+      ref={dockRef}
       id="desktop-mode-control-dock"
       className={dockOpen ? 'is-open' : undefined}
       aria-label="桌面模式控制器"
+      onMouseEnter={() => {
+        setOverControls(true);
+        desktopWindow
+          .updateDesktopPointerRoute({
+            overSoftwareUi: true,
+            overDesktopControls: true,
+          })
+          .catch(() => {});
+      }}
+      onMouseLeave={() => {
+        setOverControls(false);
+        desktopWindow
+          .updateDesktopPointerRoute({
+            overSoftwareUi: !softwareLocked,
+            overDesktopControls: false,
+          })
+          .catch(() => {});
+      }}
     >
       <button
         id="desktop-mode-control-handle"

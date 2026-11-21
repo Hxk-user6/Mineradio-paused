@@ -179,16 +179,14 @@ export function SearchBar({
     e.stopPropagation();
     const key = songIdentityKey(song);
     const provider = String(song.provider || song.source || 'netease').toLowerCase();
+    if (provider === 'qq') {
+      onToast?.('QQ 音乐暂不支持红心收藏，请前往 QQ 音乐客户端操作');
+      return;
+    }
     const id = song.id ?? song.mid ?? song.songmid ?? song.hash;
     const next = !likedKeys[key];
     try {
-      if (provider === 'qq') {
-        await apiJson('/api/qq/like', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id, mid: song.mid || song.songmid, like: next }),
-        });
-      } else if (provider === 'kugou') {
+      if (provider === 'kugou') {
         await apiJson('/api/kugou/song/like', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -248,6 +246,21 @@ export function SearchBar({
   };
 
   const handlePlayResult = async (song: SongRecord) => {
+    if (song.type === 'podcast-radio') {
+      const radioId = song.id ?? song.rid ?? song.radioId;
+      if (radioId !== undefined && radioId !== null && String(radioId).trim() !== '') {
+        setSearchQuery('');
+        setHasSearched(false);
+        setResultsOpen(true);
+        await toggleRadio({
+          id: String(radioId),
+          name: song.name || '未知播客',
+          cover: song.cover,
+          dj: song.artist,
+        });
+        return;
+      }
+    }
     setResultsOpen(false);
     onSongSelected?.(song);
     await playSong(song, searchResults);
