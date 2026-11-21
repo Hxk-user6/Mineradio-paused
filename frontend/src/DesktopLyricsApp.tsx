@@ -165,7 +165,7 @@ function computeWordProgress(word: LyricWord, currentTime: number, lineProgress:
 }
 
 export function DesktopLyricsApp(): React.ReactElement {
-  const [lyricText, setLyricText] = useState('Mineradio');
+  const [lyricText, setLyricText] = useState('MineradioX');
   const [translation, setTranslation] = useState('');
   const [nextLine, setNextLine] = useState('');
   const [words, setWords] = useState<LyricWord[]>([]);
@@ -354,7 +354,7 @@ export function DesktopLyricsApp(): React.ReactElement {
           }${playing ? '' : ' paused'}${cinema ? ' cinema' : ''}${
             highlight ? ' highlight-on' : ' highlight-off'
           }`}
-          aria-label="Mineradio desktop lyrics"
+          aria-label="MineradioX desktop lyrics"
           data-y={yPos.toFixed(2)}
           data-cinema={cinema ? '1' : '0'}
           data-highlight={highlight ? '1' : '0'}

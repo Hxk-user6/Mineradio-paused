@@ -61,7 +61,7 @@ const PROVIDER_LABELS: Record<string, string> = {
   kugou: '酷狗音乐',
   qishui: '汽水音乐',
   local: '本地曲库',
-  mineradio: 'Mineradio',
+  mineradio: 'MineradioX',
 };
 
 export const TrackDetailModal: React.FC<TrackDetailModalProps> = ({ onToast }) => {

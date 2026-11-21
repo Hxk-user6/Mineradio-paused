@@ -403,7 +403,7 @@ export function PlayerControls({
               <div className="control-meta">
                 <div id="control-title" className="control-title">
                   <span id="control-title-text" className="control-title-text">
-                    {currentSong ? currentSong.name || currentSong.title : 'Mineradio'}
+                    {currentSong ? currentSong.name || currentSong.title : 'MineradioX'}
                   </span>
                   <span id="control-title-badges" className="control-title-badges">
                     <div

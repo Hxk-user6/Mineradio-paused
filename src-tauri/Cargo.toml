@@ -1,8 +1,8 @@
 [package]
-name = "mineradio"
+name = "mineradiox"
 version = "2.2.0"
-description = "Windows 沉浸式音乐播放器，融合桌面模式、歌词舞台、粒子视觉和 3D 歌单架。"
-authors = ["Mineradio"]
+description = "跨平台沉浸式音乐播放器 MineradioX，融合桌面模式、歌词舞台、粒子视觉和 3D 歌单架。"
+authors = ["MineradioX"]
 license = "GPL-3.0-only"
 edition = "2021"
 

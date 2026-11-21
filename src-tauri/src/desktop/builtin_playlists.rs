@@ -491,7 +491,7 @@ fn build_summary(playlist: &PlaylistRecord) -> PlaylistSummary {
         source: "mineradio".to_string(),
         builtin: true,
         name: playlist.name.clone(),
-        creator: "Mineradio".to_string(),
+        creator: "MineradioX".to_string(),
         track_count: playlist.tracks.len(),
         cover,
         created_at: playlist.created_at,

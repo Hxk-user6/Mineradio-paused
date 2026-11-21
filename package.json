@@ -1,9 +1,9 @@
 {
-  "name": "mineradio",
-  "productName": "Mineradio",
+  "name": "mineradiox",
+  "productName": "MineradioX",
   "version": "2.2.0",
-  "description": "Windows 沉浸式音乐播放器，融合桌面模式、歌词舞台、粒子视觉和 3D 歌单架。",
-  "author": "Mineradio",
+  "description": "跨平台沉浸式音乐播放器 MineradioX，融合桌面模式、歌词舞台、粒子视觉和 3D 歌单架。",
+  "author": "MineradioX",
   "license": "GPL-3.0-only",
   "main": "desktop/main.js",
   "private": true,
@@ -14,8 +14,8 @@
     "build:win:internal-beta": "electron-builder --config electron-builder.internal-beta.json --win nsis --publish never"
   },
   "build": {
-    "appId": "com.mineradio.desktop",
-    "productName": "Mineradio",
+    "appId": "com.mineradiox.desktop",
+    "productName": "MineradioX",
     "directories": {
       "output": "dist",
       "buildResources": "build"
@@ -47,7 +47,7 @@
     ],
     "asar": false,
     "win": {
-      "executableName": "Mineradio",
+      "executableName": "MineradioX",
       "icon": "build/icon.ico",
       "signAndEditExecutable": false,
       "target": [
@@ -65,28 +65,28 @@
       "allowToChangeInstallationDirectory": false,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "Mineradio",
+      "shortcutName": "MineradioX",
       "installerIcon": "build/icon.ico",
       "uninstallerIcon": "build/icon.ico",
       "installerSidebar": "build/installerSidebar.bmp",
       "uninstallerSidebar": "build/installerSidebar.bmp",
       "installerHeader": "build/installerHeader.bmp",
       "include": "build/installer.nsh",
-      "artifactName": "Mineradio-${version}-Setup.${ext}"
+      "artifactName": "MineradioX-${version}-Setup.${ext}"
     },
     "publish": [
       {
         "provider": "github",
-        "owner": "XxHuberrr",
-        "repo": "Mineradio"
+        "owner": "Nanping5",
+        "repo": "Mineradio-paused"
       }
     ]
   },
   "mineradio": {
     "update": {
       "provider": "github",
-      "owner": "XxHuberrr",
-      "repo": "Mineradio",
+      "owner": "Nanping5",
+      "repo": "Mineradio-paused",
       "preview": false,
       "preferMirrors": true,
       "mirrors": [

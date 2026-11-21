@@ -2666,7 +2666,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mineradio"
+name = "mineradiox"
 version = "2.2.0"
 dependencies = [
  "aes",

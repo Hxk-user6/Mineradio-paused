@@ -109,7 +109,7 @@ export function SplashScreen(): React.ReactElement | null {
       className={`${ready ? 'ready' : ''}${exiting ? ' exiting hide' : ''}`.trim()}
       role="button"
       tabIndex={0}
-      aria-label="Mineradio 启动页，点击进入"
+      aria-label="MineradioX 启动页，点击进入"
       onClick={handleEnter}
       onKeyDown={(e) => {
         if (e.key === 'Enter' || e.key === ' ') {
@@ -121,12 +121,13 @@ export function SplashScreen(): React.ReactElement | null {
       <canvas id="splash-canvas" ref={canvasRef} />
       <div className="splash-bg-noise" />
       <div className="splash-content">
-        <div className="splash-wordmark" id="splash-wordmark" aria-label="Mineradio">
+        <div className="splash-wordmark" id="splash-wordmark" aria-label="MineradioX">
           <span className="splash-word-mine">Mine</span>
-          <span className="splash-word-radio" aria-label="radio">
+          <span className="splash-word-radio" aria-label="radioX">
             rad
             <span className="splash-word-i" aria-hidden="true" />
             <span className="splash-word-o">o</span>
+            <span className="splash-word-x">X</span>
           </span>
         </div>
         <div className="splash-signal-line" />

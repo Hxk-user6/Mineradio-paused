@@ -1061,7 +1061,7 @@ export function AccountAndLoginModal({
           <div className="update-panel-inner">
             <div className="update-panel-head">
               <div>
-                <div className="update-kicker">MINERADIO</div>
+                <div className="update-kicker">MINERADIOX</div>
                 <div id="update-modal-title" className="update-title">
                   {hasUpdate ? '发现新版本' : '版本信息'}
                 </div>

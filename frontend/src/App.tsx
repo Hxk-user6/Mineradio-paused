@@ -585,9 +585,9 @@ export function App(): React.ReactElement {
 
     desktopWindow
       .updateDesktopLyrics({
-        title: currentSong?.name || 'Mineradio',
+        title: currentSong?.name || 'MineradioX',
         artist: currentSong?.artist || '',
-        line: line?.text || currentSong?.name || 'Mineradio',
+        line: line?.text || currentSong?.name || 'MineradioX',
         translation: line?.translation || '',
         nextLine: nextLine?.text || '',
         playing,

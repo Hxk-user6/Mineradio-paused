@@ -40,8 +40,8 @@ const QISHUI_VIRTUAL_FEED_PLAYLIST_ID: &str = "qishui-feed";
 const QISHUI_WEB_LIKED_PLAYLIST_ID: &str = "qishui-liked";
 const QISHUI_WEB_RECENT_PLAYLIST_ID: &str = "qishui-recent";
 
-const QISHUI_UA: &str = "Mineradio/2.1.0 (Qishui official OpenAPI bridge)";
-const QISHUI_PUBLIC_UA: &str = "Mineradio/2.1.0 (Qishui public catalog bridge)";
+const QISHUI_UA: &str = "MineradioX/2.2.0 (Qishui official OpenAPI bridge)";
+const QISHUI_PUBLIC_UA: &str = "MineradioX/2.2.0 (Qishui public catalog bridge)";
 const QISHUI_WEB_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) SodaMusic/3.2.1 Chrome/136.0.7103.59 Electron/36.4.0-rs.22.release.main.1 TTElectron/36.4.0-rs.22.release.main.1 Safari/537.36";
 const QISHUI_PC_APP_UA: &str = "LunaPC/3.3.0(359450208)";
 
@@ -2370,7 +2370,7 @@ impl QishuiClient {
             } else if token_configured {
                 "已有旧版开放平台目录授权；账号功能仍需完成官方扫码登录。"
             } else {
-                "请使用抖音 App 扫描 Mineradio 中的汽水官方二维码；未登录时仅保留公开搜索匹配。"
+                "请使用抖音 App 扫描 MineradioX 中的汽水官方二维码；未登录时仅保留公开搜索匹配。"
             }
         })
     }

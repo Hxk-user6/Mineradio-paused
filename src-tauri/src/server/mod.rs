@@ -521,7 +521,7 @@ pub async fn start_local_server(state: Arc<AppBackendState>) -> Result<u16, Stri
     let app = build_router(state);
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
-            eprintln!("[Mineradio Axum Server] error: {e}");
+            eprintln!("[MineradioX Axum Server] error: {e}");
         }
     });
     Ok(port)
@@ -535,7 +535,7 @@ async fn spotify_removed() -> Response {
         json!({
             "ok": false,
             "error": "PROVIDER_REMOVED",
-            "message": "该平台接口已从 Mineradio 移除。",
+            "message": "该平台接口已从 MineradioX 移除。",
         }),
     )
 }
@@ -547,7 +547,7 @@ async fn update_external_only() -> Response {
             "ok": false,
             "externalOnly": true,
             "error": "UPDATE_EXTERNAL_ONLY",
-            "message": "Mineradio 已停用客户端本地下载与快速补丁，请使用外部下载页面。",
+            "message": "MineradioX 已停用客户端本地下载与快速补丁，请使用外部下载页面。",
         }),
     )
 }
@@ -555,14 +555,14 @@ async fn update_external_only() -> Response {
 async fn app_version(State(state): State<Arc<AppBackendState>>) -> Response {
     let paths = state.config.paths();
     ok_json(json!({
-        "name": "mineradio",
+        "name": "mineradiox",
         "productName": paths.runtime_name,
         "version": paths.app_version,
         "update": {
             "provider": "github",
             "configured": true,
-            "owner": "XxHuberrr",
-            "repo": "Mineradio",
+            "owner": "Nanping5",
+            "repo": "Mineradio-paused",
             "preview": false,
             "manifestOverride": !paths.update_manifest.is_empty(),
         }
@@ -623,10 +623,10 @@ async fn update_latest(State(state): State<Arc<AppBackendState>>) -> Response {
         }
     }
 
-    let api_url = "https://api.github.com/repos/XxHuberrr/Mineradio/releases/latest";
+    let api_url = "https://api.github.com/repos/Nanping5/Mineradio-paused/releases/latest";
     if let Ok(resp) = shared_http_client()
         .get(api_url)
-        .header("User-Agent", format!("Mineradio/{current}"))
+        .header("User-Agent", format!("MineradioX/{current}"))
         .header("Accept", "application/vnd.github+json")
         .timeout(std::time::Duration::from_millis(8500))
         .send()
@@ -641,9 +641,9 @@ async fn update_latest(State(state): State<Arc<AppBackendState>>) -> Response {
 
     // Fallback to latest.yml
     let yml_candidates = [
-        "https://gh.llkk.cc/https://github.com/XxHuberrr/Mineradio/releases/latest/download/latest.yml",
-        "https://ghfast.top/https://github.com/XxHuberrr/Mineradio/releases/latest/download/latest.yml",
-        "https://github.com/XxHuberrr/Mineradio/releases/latest/download/latest.yml",
+        "https://gh.llkk.cc/https://github.com/Nanping5/Mineradio-paused/releases/latest/download/latest.yml",
+        "https://ghfast.top/https://github.com/Nanping5/Mineradio-paused/releases/latest/download/latest.yml",
+        "https://github.com/Nanping5/Mineradio-paused/releases/latest/download/latest.yml",
     ];
     for candidate in yml_candidates {
         if let Ok(resp) = shared_http_client()
@@ -661,7 +661,7 @@ async fn update_latest(State(state): State<Arc<AppBackendState>>) -> Response {
                             .map(normalize_version)
                             .filter(|s| !s.is_empty())
                             .unwrap_or_else(|| current.clone());
-                        let html_url = format!("https://github.com/XxHuberrr/Mineradio/releases/tag/v{ver}");
+                        let html_url = format!("https://github.com/Nanping5/Mineradio-paused/releases/tag/v{ver}");
                         return ok_json(json!({
                             "configured": true,
                             "preview": false,
@@ -671,14 +671,14 @@ async fn update_latest(State(state): State<Arc<AppBackendState>>) -> Response {
                             "source": "latest-yml",
                             "release": {
                                 "tagName": format!("v{ver}"),
-                                "name": format!("Mineradio v{ver}"),
+                                "name": format!("MineradioX v{ver}"),
                                 "version": ver,
                                 "publishedAt": yml.get("releaseDate").and_then(|v| v.as_str()).unwrap_or(""),
                                 "htmlUrl": html_url,
                                 "downloadPageUrl": html_url,
                                 "downloadPages": [],
                                 "summary": "发现新版本，请前往发布页面获取安装包。",
-                                "notes": ["更新入口已改为浏览器外部下载", "Mineradio 不再在本地下载或应用补丁"],
+                                "notes": ["更新入口已改为浏览器外部下载", "MineradioX 不再在本地下载或应用补丁"],
                             }
                         }));
                     }
@@ -733,7 +733,7 @@ fn format_github_release(current: &str, data: &Value) -> Value {
         "latestVersion": latest,
         "release": {
             "tagName": data.get("tag_name").and_then(|v| v.as_str()).unwrap_or(&format!("v{latest}")),
-            "name": data.get("name").and_then(|v| v.as_str()).unwrap_or(&format!("Mineradio v{latest}")),
+            "name": data.get("name").and_then(|v| v.as_str()).unwrap_or(&format!("MineradioX v{latest}")),
             "version": latest,
             "publishedAt": data.get("published_at").and_then(|v| v.as_str()).unwrap_or(""),
             "htmlUrl": html_url,
@@ -3007,7 +3007,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let ver: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(ver["name"], "mineradio");
+        assert_eq!(ver["name"], "mineradiox");
 
         // 2. Spotify removed -> 404
         let resp = app

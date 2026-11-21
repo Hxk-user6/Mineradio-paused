@@ -17,7 +17,7 @@ const DAILY_REVIEWS = [
   { text: '错过落日余晖，还会有满天星辰。', source: '每日热评' },
   { text: '保持热爱，奔赴下一场山海。', source: '每日热评' },
   { text: '答案在路上，自由在风里。', source: '每日热评' },
-  { text: '让今天的声音，从你喜欢的地方开始。', source: 'Mineradio' },
+  { text: '让今天的声音，从你喜欢的地方开始。', source: 'MineradioX' },
 ];
 
 type RecommendPlatform = 'netease' | 'qishui' | 'qq' | 'kugou';
@@ -271,7 +271,7 @@ export function HomeDashboard({
 
   return (
     <>
-      <section id="empty-home" aria-label="Mineradio 音乐首页">
+      <section id="empty-home" aria-label="MineradioX 音乐首页">
         <div className="empty-home-shell">
           <div className="home-hero" aria-live="polite">
             <div className="daily-review-card">
@@ -385,7 +385,7 @@ export function HomeDashboard({
               <div className="home-card-sub">
                 {dailySongs.length
                   ? `${dailySongs.length} 首推荐已就绪`
-                  : '使用当前 Mineradio 推荐数据'}
+                  : '使用当前 MineradioX 推荐数据'}
               </div>
               <div className="home-card-art" />
             </button>

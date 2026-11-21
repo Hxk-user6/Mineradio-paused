@@ -481,7 +481,7 @@ export function FxConsoleModal({ onToast }: FxConsoleModalProps): React.ReactEle
         <div className="fx-head">
           <div>
             <div className="fx-title">视觉控制台</div>
-            <div className="fx-sub">MINERADIO VISUALS · 6 大任务工作台</div>
+            <div className="fx-sub">MINERADIOX VISUALS · 6 大任务工作台</div>
           </div>
           <button
             type="button"

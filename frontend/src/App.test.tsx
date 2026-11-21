@@ -710,4 +710,18 @@ describe('Mineradio UI & Desktop Lyrics', () => {
       'grid-template-columns: minmax(0, 1fr) max-content minmax(max-content, 1fr);'
     );
   });
+
+  it('应用内界面标题、启动页词标与控制台品牌均显示 MineradioX', () => {
+    usePlayerStore.setState({ splashDone: false });
+    const { container } = render(<App />);
+    expect(container.querySelector('.desktop-app-title')?.textContent).toBe('MineradioX');
+    expect(container.querySelector('#splash-wordmark')?.getAttribute('aria-label')).toBe(
+      'MineradioX'
+    );
+    expect(container.querySelector('.splash-word-x')?.textContent).toBe('X');
+    expect(container.querySelector('.fx-sub')?.textContent).toContain('MINERADIOX VISUALS');
+    expect(container.querySelector('#empty-home')?.getAttribute('aria-label')).toBe(
+      'MineradioX 音乐首页'
+    );
+  });
 });

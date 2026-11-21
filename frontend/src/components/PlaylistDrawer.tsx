@@ -1144,7 +1144,7 @@ export function PlaylistDrawer({
             <input
               id="collect-new-name"
               type="text"
-              placeholder="新建 Mineradio 内置歌单"
+              placeholder="新建 MineradioX 内置歌单"
               autoComplete="off"
               maxLength={40}
               value={collectNewName}

@@ -308,7 +308,7 @@ pub fn run() {
             let lyrics_item = MenuItemBuilder::with_id("tray_lyrics", "切换桌面歌词").build(app)?;
             let exit_desktop_item =
                 MenuItemBuilder::with_id("tray_exit_desktop_mode", "退出壁纸模式").build(app)?;
-            let quit_item = MenuItemBuilder::with_id("tray_quit", "退出 Mineradio").build(app)?;
+            let quit_item = MenuItemBuilder::with_id("tray_quit", "退出 MineradioX").build(app)?;
             let tray_menu = MenuBuilder::new(app)
                 .items(&[&show_item, &lyrics_item, &exit_desktop_item, &quit_item])
                 .build()?;
@@ -317,7 +317,7 @@ pub fn run() {
             if let Ok(tray_icon_img) = tauri::image::Image::from_bytes(icon_bytes) {
                 let _tray = TrayIconBuilder::with_id("mineradio-tray")
                     .icon(tray_icon_img)
-                    .tooltip("Mineradio")
+                    .tooltip("MineradioX")
                     .menu(&tray_menu)
                     .on_menu_event(|app, event| match event.id().as_ref() {
                         "tray_show" => {
@@ -386,7 +386,7 @@ pub fn run() {
                 "main",
                 WebviewUrl::App("index.html".into()),
             )
-            .title("Mineradio")
+            .title("MineradioX")
             .inner_size(1280.0, 820.0)
             .min_inner_size(960.0, 620.0)
             .decorations(false)
@@ -501,7 +501,7 @@ pub fn run() {
             commands::close_platform_login_window,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running Mineradio");
+        .expect("error while running MineradioX");
 }
 
 #[cfg(test)]

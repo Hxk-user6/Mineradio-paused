@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 
-pub const DEFAULT_APP_NAME: &str = "Mineradio";
+pub const DEFAULT_APP_NAME: &str = "MineradioX";
 pub const DEFAULT_APP_VERSION: &str = "2.2.0";
 pub const CACHE_SETTINGS_FILE: &str = "cache-settings.json";
 pub const CURRENT_FX_AUTOSAVE_FILE: &str = "current-fx-autosave.json";

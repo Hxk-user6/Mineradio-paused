@@ -1131,7 +1131,7 @@ export const usePlayerStore = create<PlayerStoreState>()((set, get) => ({
     const st = get();
     const line = st.lyrics[st.activeLyricIdx];
     const res = await desktopWindow.setDesktopLyricsEnabled(next, {
-      title: st.currentSong?.name || 'Mineradio',
+      title: st.currentSong?.name || 'MineradioX',
       artist: st.currentSong?.artist || '',
       line: line?.text || st.currentSong?.name || '',
       translation: line?.translation || '',

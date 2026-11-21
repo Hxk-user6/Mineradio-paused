@@ -741,7 +741,7 @@ fn ensure_desktop_lyrics_window(app: &AppHandle) -> Result<tauri::WebviewWindow,
         DESKTOP_LYRICS_LABEL,
         WebviewUrl::App("desktop-lyrics.html".into()),
     )
-    .title("Mineradio 桌面歌词")
+    .title("MineradioX 桌面歌词")
     .inner_size(760.0, 180.0)
     .min_inner_size(360.0, 96.0)
     .decorations(false)
@@ -1191,7 +1191,7 @@ pub fn start_wallpaper_engine_scene(
         "ok": false,
         "supported": cfg!(target_os = "windows"),
         "active": false,
-        "message": "Wallpaper Engine scene native host is deferred on Tauri; video/image layers play directly inside Mineradio.",
+        "message": "Wallpaper Engine scene native host is deferred on Tauri; video/image layers play directly inside MineradioX.",
     })
 }
 

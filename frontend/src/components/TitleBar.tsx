@@ -53,7 +53,7 @@ export function TitleBar({
         <div className="desktop-drag-region" data-tauri-drag-region>
           <div className="desktop-app-mark" aria-hidden="true" />
           <div className="desktop-app-title" aria-hidden="true">
-            Mineradio
+            MineradioX
           </div>
         </div>
         <div className="desktop-window-controls">
