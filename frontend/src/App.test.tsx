@@ -371,4 +371,78 @@ describe('Mineradio UI & Desktop Lyrics', () => {
       expect(enabledSpy).toHaveBeenCalledWith(false);
     });
   });
+
+  it('AccountAndLoginModal 网易云二维码轮询 802 -> 803 后立即同步登录态并关闭弹窗', async () => {
+    vi.useFakeTimers();
+    try {
+      usePlayerStore.setState({ easterEggUnlocked: true });
+      const onCloseLoginModal = vi.fn();
+      const onToast = vi.fn();
+
+      let checkCalls = 0;
+      const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+        const url = String(input);
+        if (url.includes('/api/login/qr/key')) {
+          return new Response(JSON.stringify({ key: 'qr-key-test' }), { status: 200 });
+        }
+        if (url.includes('/api/login/qr/create')) {
+          return new Response(
+            JSON.stringify({ img: 'data:image/png;base64,AAA', url: 'https://music.163.com/login?codekey=qr-key-test' }),
+            { status: 200 }
+          );
+        }
+        if (url.includes('/api/login/qr/check')) {
+          checkCalls += 1;
+          if (checkCalls === 1) {
+            return new Response(JSON.stringify({ code: 802, message: '待确认' }), { status: 200 });
+          }
+          return new Response(
+            JSON.stringify({
+              code: 803,
+              loggedIn: true,
+              hasCookie: true,
+              userId: '123456',
+              nickname: '测试云村用户',
+              avatar: 'https://example.com/a.png',
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response(JSON.stringify({ loggedIn: true, nickname: '测试云村用户' }), { status: 200 });
+      });
+
+      render(
+        <AccountAndLoginModal
+          loginModalOpen={true}
+          onCloseLoginModal={onCloseLoginModal}
+          onToast={onToast}
+        />
+      );
+
+      const getQrBtn = screen.getByRole('button', { name: '获取二维码登录' });
+      await act(async () => {
+        fireEvent.click(getQrBtn);
+        await Promise.resolve();
+      });
+
+      expect(screen.getByAltText('netease 登录二维码')).toBeTruthy();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1100);
+      });
+      expect(screen.getByText('已扫码，请在手机确认登录…')).toBeTruthy();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1900);
+      });
+
+      expect(usePlayerStore.getState().platformLogins.netease.loggedIn).toBe(true);
+      expect(usePlayerStore.getState().platformLogins.netease.nickname).toBe('测试云村用户');
+      expect(onCloseLoginModal).toHaveBeenCalledTimes(1);
+      expect(onToast).toHaveBeenCalledWith('网易云已登录：测试云村用户');
+      fetchMock.mockRestore();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

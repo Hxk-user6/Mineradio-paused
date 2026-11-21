@@ -48,6 +48,7 @@ export function AccountAndLoginModal({
   const resetEasterEgg = usePlayerStore((s) => s.resetEasterEgg);
   const refreshLoginStatuses = usePlayerStore((s) => s.refreshLoginStatuses);
   const refreshAllUserPlaylists = usePlayerStore((s) => s.refreshAllUserPlaylists);
+  const refreshHomeDiscover = usePlayerStore((s) => s.refreshHomeDiscover);
   const checkUpdates = usePlayerStore((s) => s.checkUpdates);
 
   const [internalLoginOpen, setInternalLoginOpen] = useState(false);
@@ -113,17 +114,21 @@ export function AccountAndLoginModal({
   }, [loginOpen, stopPolling]);
 
   useEffect(() => {
-    const off = desktopWindow.onPlatformLoginSuccess(() => {
+    const off = desktopWindow.onPlatformLoginSuccess((ev) => {
       refreshLoginStatuses().catch(() => {});
       refreshAllUserPlaylists().catch(() => {});
+      refreshHomeDiscover().catch(() => {});
       setQrStatus('官方弹窗登录成功，已同步账号信息');
       setQrStateClass('scan');
+      if (ev?.provider) {
+        onToast?.('平台账号登录成功');
+      }
     });
     return () => {
       if (typeof off === 'function') off();
       if (cinematicTimerRef.current) clearTimeout(cinematicTimerRef.current);
     };
-  }, [refreshLoginStatuses, refreshAllUserPlaylists]);
+  }, [refreshLoginStatuses, refreshAllUserPlaylists, refreshHomeDiscover, onToast]);
 
   const handleSubmitEasterEgg = async (e?: React.FormEvent) => {
     e?.preventDefault();
@@ -158,6 +163,45 @@ export function AccountAndLoginModal({
   };
 
   const pollNeteaseQr = (key: string, token: number) => {
+    let consecutiveErrors = 0;
+    const finishSuccess = (info: {
+      loggedIn?: boolean;
+      userId?: string | number;
+      nickname?: string;
+      avatar?: string;
+      avatarUrl?: string;
+      vipType?: number;
+      vipLevel?: 'none' | 'vip' | 'svip';
+      isVip?: boolean;
+      isSvip?: boolean;
+      vipLabel?: string;
+    }) => {
+      stopPolling();
+      setQrStatus('登录成功！正在同步账号信息…');
+      setQrStateClass('scan');
+      usePlayerStore.setState((state) => ({
+        platformLogins: {
+          ...state.platformLogins,
+          netease: {
+            ...state.platformLogins.netease,
+            loggedIn: true,
+            userId: info.userId ?? state.platformLogins.netease.userId,
+            nickname: info.nickname || state.platformLogins.netease.nickname || '网易云用户',
+            avatar: info.avatar || info.avatarUrl || state.platformLogins.netease.avatar,
+            avatarUrl: info.avatarUrl || info.avatar || state.platformLogins.netease.avatarUrl,
+            vipType: info.vipType ?? state.platformLogins.netease.vipType,
+            cookieValid: true,
+            updatedAt: Date.now(),
+          },
+        },
+      }));
+      refreshLoginStatuses().catch(() => {});
+      refreshAllUserPlaylists().catch(() => {});
+      refreshHomeDiscover().catch(() => {});
+      onToast?.(`网易云已登录${info.nickname ? `：${info.nickname}` : ''}`);
+      closeLogin();
+    };
+
     const check = async () => {
       if (pollTokenRef.current !== token) return;
       try {
@@ -165,9 +209,22 @@ export function AccountAndLoginModal({
           code?: number;
           loggedIn?: boolean;
           hasCookie?: boolean;
+          userId?: string | number;
           nickname?: string;
-        }>(`/api/login/qr/check?key=${encodeURIComponent(key)}&t=${Date.now()}`);
+          avatar?: string;
+          avatarUrl?: string;
+          vipType?: number;
+          vipLevel?: 'none' | 'vip' | 'svip';
+          isVip?: boolean;
+          isSvip?: boolean;
+          vipLabel?: string;
+        }>(`/api/login/qr/check?key=${encodeURIComponent(key)}&t=${Date.now()}`, {
+          timeoutMs: 8000,
+          cache: 'no-store',
+        });
         if (pollTokenRef.current !== token) return;
+        consecutiveErrors = 0;
+
         if (res.code === 800) {
           setQrStatus('二维码已过期，请重新生成');
           setQrStateClass('fail');
@@ -180,23 +237,44 @@ export function AccountAndLoginModal({
         } else if (res.code === 802) {
           setQrStatus('已扫码，请在手机确认登录…');
           setQrStateClass('scan');
-        } else if (res.code === 803 && (res.loggedIn || res.hasCookie)) {
+        } else if (res.code === 803) {
+          if (res.loggedIn || res.hasCookie) {
+            finishSuccess(res);
+            return;
+          }
+          const fallbackStatus = await apiJson<{
+            loggedIn?: boolean;
+            userId?: string | number;
+            nickname?: string;
+            avatar?: string;
+            avatarUrl?: string;
+          }>(`/api/login/status?t=${Date.now()}`, {
+            timeoutMs: 4000,
+            cache: 'no-store',
+          }).catch(() => null);
+          if (pollTokenRef.current !== token) return;
+          if (fallbackStatus?.loggedIn) {
+            finishSuccess(fallbackStatus);
+            return;
+          }
+          setQrStatus('扫码已确认，但未获取到登录凭证，请重新获取二维码');
+          setQrStateClass('fail');
           stopPolling();
-          setQrStatus('登录成功！正在同步账号信息…');
-          setQrStateClass('scan');
-          await refreshLoginStatuses();
-          onToast?.(`网易云已登录${res.nickname ? `：${res.nickname}` : ''}`);
-          closeLogin();
           return;
         }
-        pollTimerRef.current = setTimeout(check, 2000);
+        pollTimerRef.current = setTimeout(check, 1800);
       } catch {
         if (pollTokenRef.current === token) {
-          pollTimerRef.current = setTimeout(check, 2500);
+          consecutiveErrors += 1;
+          if (consecutiveErrors >= 3) {
+            setQrStatus('扫码状态轮询异常，正在重试…');
+            setQrStateClass('preview');
+          }
+          pollTimerRef.current = setTimeout(check, 2200);
         }
       }
     };
-    pollTimerRef.current = setTimeout(check, 1200);
+    pollTimerRef.current = setTimeout(check, 1000);
   };
 
   const pollQishuiQr = (qrToken: string, pollId: number) => {
@@ -208,13 +286,17 @@ export function AccountAndLoginModal({
           expired?: boolean;
           nickname?: string;
           status?: string;
-        }>(`/api/qishui/login/check?token=${encodeURIComponent(qrToken)}&t=${Date.now()}`);
+        }>(`/api/qishui/login/check?token=${encodeURIComponent(qrToken)}&t=${Date.now()}`, {
+          timeoutMs: 8000,
+          cache: 'no-store',
+        });
         if (pollTokenRef.current !== pollId) return;
         if (res.loggedIn) {
           stopPolling();
           setQrStatus('汽水音乐登录成功！');
           setQrStateClass('scan');
-          await refreshLoginStatuses();
+          refreshLoginStatuses().catch(() => {});
+          refreshAllUserPlaylists().catch(() => {});
           onToast?.(`汽水音乐已登录${res.nickname ? `：${res.nickname}` : ''}`);
           closeLogin();
           return;
@@ -225,14 +307,14 @@ export function AccountAndLoginModal({
           setQrStateClass('fail');
           return;
         }
-        pollTimerRef.current = setTimeout(check, 2500);
+        pollTimerRef.current = setTimeout(check, 2200);
       } catch {
         if (pollTokenRef.current === pollId) {
-          pollTimerRef.current = setTimeout(check, 3500);
+          pollTimerRef.current = setTimeout(check, 3000);
         }
       }
     };
-    pollTimerRef.current = setTimeout(check, 1500);
+    pollTimerRef.current = setTimeout(check, 1200);
   };
 
   const startProviderLogin = async (target: LoginProvider) => {
@@ -885,7 +967,7 @@ export function AccountAndLoginModal({
                   </button>
                   <button
                     id="qq-cookie-toggle-btn"
-                    className="modal-btn"
+                    className="modal-btn show"
                     type="button"
                     onClick={() => setCookieOpen((v) => !v)}
                   >
