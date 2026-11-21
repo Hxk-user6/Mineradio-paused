@@ -1202,7 +1202,7 @@ mod tests {
 
     #[test]
     fn env_overrides_and_discover_priority() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _guard = EnvGuard::capture(&[
             "MINERADIO_STARTUP_QA_HIDDEN",
             "MINERADIO_STARTUP_QA_USER_DATA",
@@ -1305,7 +1305,7 @@ mod tests {
 
     #[test]
     fn beatmap_cache_c_drive_protection_and_roundtrip() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _guard = EnvGuard::capture(&["MINERADIO_BEAT_CACHE_DIR"]);
 
         let tmp = TempDir::new().unwrap();
@@ -1320,8 +1320,35 @@ mod tests {
             .unwrap_err();
         assert_eq!(write_err.code(), "BEAT_CACHE_ON_C_DRIVE_DISABLED");
 
-        // 正常目录读写测试
-        let beat_dir = tmp.path().join("beatmaps");
+        // 正常目录读写测试（Windows 下系统 Temp 常位于 C 盘，需选取非 C 盘目录测试放行写入）
+        let non_c_tmp = if cfg!(windows)
+            && tmp
+                .path()
+                .to_string_lossy()
+                .to_ascii_uppercase()
+                .starts_with("C:")
+        {
+            std::env::current_dir()
+                .ok()
+                .filter(|p| !p.to_string_lossy().to_ascii_uppercase().starts_with("C:"))
+                .and_then(|p| TempDir::new_in(p).ok())
+                .or_else(|| TempDir::new_in(Path::new(r"D:\")).ok())
+        } else {
+            None
+        };
+        let beat_parent = non_c_tmp
+            .as_ref()
+            .map(TempDir::path)
+            .unwrap_or_else(|| tmp.path());
+        if cfg!(windows)
+            && beat_parent
+                .to_string_lossy()
+                .to_ascii_uppercase()
+                .starts_with("C:")
+        {
+            return;
+        }
+        let beat_dir = beat_parent.join("beatmaps");
         std::env::set_var("MINERADIO_BEAT_CACHE_DIR", &beat_dir);
         let cfg_ok = ConfigManager::with_user_data_dir(tmp.path(), tmp.path().join("ud-ok"));
         let ok_info = cfg_ok.beat_cache_root_info();

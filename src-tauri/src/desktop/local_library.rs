@@ -1573,7 +1573,11 @@ mod tests {
         assert!(normalized_absolute_file_path(r"\\server\share\song.mp3").is_none());
         assert!(normalized_absolute_file_path("//server/share/song.mp3").is_none());
         assert!(supported_audio_path("/tmp/demo/track.txt").is_none());
-        assert!(supported_audio_path("/tmp/demo/track.OPUS").is_some());
+        #[cfg(windows)]
+        let abs_opus = r"C:\demo\track.OPUS";
+        #[cfg(not(windows))]
+        let abs_opus = "/tmp/demo/track.OPUS";
+        assert!(supported_audio_path(abs_opus).is_some());
     }
 
     #[test]
