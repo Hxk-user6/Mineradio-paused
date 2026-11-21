@@ -126,6 +126,7 @@ export function App(): React.ReactElement {
   const setDiyMode = usePlayerStore((s) => s.setDiyMode);
   const setFxPanelOpen = usePlayerStore((s) => s.setFxPanelOpen);
   const setPlaylistPanelOpen = usePlayerStore((s) => s.setPlaylistPanelOpen);
+  const setControlsHidden = usePlayerStore((s) => s.setControlsHidden);
   const setGestureEnabled = usePlayerStore((s) => s.setGestureEnabled);
   const submitCuefieldFeedback = usePlayerStore((s) => s.submitCuefieldFeedback);
   const dismissCuefieldFeedback = usePlayerStore((s) => s.dismissCuefieldFeedback);
@@ -410,10 +411,17 @@ export function App(): React.ReactElement {
     }
   }, [audioError, showToast]);
 
-  // 监听 fx 调用 applyFxCssVariables(fx)，并同步 document.body 类名（包括 controls-hidden、immersive-mode）
+  // 监听 fx 调用 applyFxCssVariables(fx)，并同步 document.documentElement / document.body 类名
   useEffect(() => {
     if (typeof document === 'undefined') return;
     applyFxCssVariables(fx);
+
+    const html = document.documentElement;
+    html.classList.toggle('diy-mode-preload', diyMode);
+    html.classList.toggle('simple-mode-preload', !diyMode);
+    if (splashDone) {
+      html.classList.remove('startup-fast-skip-preload');
+    }
 
     const body = document.body;
     body.classList.add('desktop-shell');
@@ -446,6 +454,13 @@ export function App(): React.ReactElement {
     isFullScreen,
     resolvedBgMediaUrl,
   ]);
+
+  // 关闭 DIY 模式时自动收起 FX 视觉控制台，避免残留展开状态
+  useEffect(() => {
+    if (!diyMode) {
+      setFxPanelOpen(false);
+    }
+  }, [diyMode, setFxPanelOpen]);
 
   // 监听桌面窗口状态与全局热键
   useEffect(() => {
@@ -938,7 +953,10 @@ export function App(): React.ReactElement {
 
         <HomeDashboard
           onOpenLibrary={() => setPlaylistPanelOpen(true)}
-          onOpenPlayerConsole={() => setFxPanelOpen(true)}
+          onOpenPlayerConsole={() => {
+            setControlsHidden(false);
+            if (diyMode) setFxPanelOpen(true);
+          }}
           onExitHome={() => setShowHome(false)}
           onToast={showToast}
         />

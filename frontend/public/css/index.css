@@ -2272,7 +2272,9 @@ body.simple-mode #search-results {
 
 body.simple-mode #quality-control,
 body.simple-mode #controls-hide-btn,
-body.simple-mode .fullscreen-toggle-btn {
+body.simple-mode .fullscreen-toggle-btn,
+body.simple-mode #shelf-toggle-btn,
+body.simple-mode #fx-panel-toggle-btn {
   display: none !important
 }
 
@@ -7206,8 +7208,8 @@ body.diy-mode #bottom-bar.stage-mode {
 #controls,
 body.simple-mode #controls,
 body.diy-mode #controls {
-  grid-template-columns: minmax(0, 1fr) max-content minmax(0, 1fr);
-  gap: clamp(8px, 1.7vw, 18px);
+  grid-template-columns: minmax(0, 1fr) max-content minmax(max-content, 1fr);
+  gap: clamp(8px, 1.4vw, 16px);
 }
 
 .control-cluster {
@@ -7229,6 +7231,26 @@ body.diy-mode #controls {
 .control-cluster.modes {
   justify-content: flex-end;
   overflow: visible;
+}
+
+body.diy-mode .control-cluster.modes {
+  gap: clamp(4px, 0.7vw, 8px);
+}
+
+body.diy-mode .control-cluster.modes .ctrl-btn {
+  width: 32px;
+  height: 32px;
+}
+
+body.diy-mode .control-cluster.modes .ctrl-btn svg {
+  width: 18px;
+  height: 18px;
+}
+
+body.diy-mode .control-cluster.modes #time-display {
+  min-width: 66px;
+  font-size: 11.5px;
+  white-space: nowrap;
 }
 
 .control-track {
@@ -7266,7 +7288,7 @@ body.diy-mode #controls {
   #controls,
   body.simple-mode #controls,
   body.diy-mode #controls {
-    grid-template-columns: minmax(0, 1fr) max-content minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr) max-content minmax(max-content, 1fr);
   }
 
   .control-meta {
@@ -7434,6 +7456,9 @@ body.immersive-mode #heart-btn,
 body.immersive-mode #collect-btn,
 body.immersive-mode #play-mode-btn,
 body.immersive-mode .lyrics-toggle-btn,
+body.immersive-mode #desktop-lyrics-btn,
+body.immersive-mode #shelf-toggle-btn,
+body.immersive-mode #fx-panel-toggle-btn,
 body.immersive-mode #mini-queue-btn,
 body.immersive-mode #quality-control,
 body.immersive-mode #volume-control,

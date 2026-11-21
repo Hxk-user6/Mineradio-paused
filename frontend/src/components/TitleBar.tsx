@@ -90,7 +90,7 @@ export function TitleBar({
           </button>
           <button
             id="diy-mode-btn"
-            className={`desktop-mode-btn${diyMode ? ' active' : ''}`}
+            className={`desktop-mode-btn${diyMode ? ' on' : ''}`}
             type="button"
             onClick={handleToggleDiy}
             title={diyMode ? '关闭 DIY 玩家模式' : '开启 DIY 玩家模式'}
@@ -154,7 +154,7 @@ export function TitleBar({
       <div id="fullscreen-diy-zone" aria-hidden={!isFullScreen}>
         <button
           id="fullscreen-diy-btn"
-          className={`desktop-mode-btn${diyMode ? ' active' : ''}`}
+          className={`desktop-mode-btn${diyMode ? ' on' : ''}`}
           type="button"
           onClick={handleToggleDiy}
           title="DIY"

@@ -630,4 +630,84 @@ describe('Mineradio UI & Desktop Lyrics', () => {
     });
     expect(usePlayerStore.getState().duration).toBe(134);
   });
+
+  it('切换 DIY 模式时同步移除 html.simple-mode-preload、点亮 .on 指示灯并可开关 FX 控制台', async () => {
+    document.documentElement.className = 'simple-mode-preload startup-fast-skip-preload';
+    usePlayerStore.setState({ diyMode: false, fxPanelOpen: false, splashDone: true });
+
+    const { container } = render(<App />);
+
+    const diyBtn = container.querySelector('#diy-mode-btn') as HTMLButtonElement;
+    const fullscreenDiyBtn = container.querySelector('#fullscreen-diy-btn') as HTMLButtonElement;
+    const fxFab = container.querySelector('#fx-fab') as HTMLButtonElement;
+    const fxPanel = container.querySelector('#fx-panel') as HTMLElement;
+    const fxToggleBtn = container.querySelector('#fx-panel-toggle-btn') as HTMLButtonElement;
+
+    expect(diyBtn).not.toBeNull();
+    expect(fullscreenDiyBtn).not.toBeNull();
+    expect(diyBtn.className).not.toContain(' on');
+    expect(document.documentElement.classList.contains('simple-mode-preload')).toBe(true);
+    expect(document.documentElement.classList.contains('startup-fast-skip-preload')).toBe(false);
+    expect(document.body.classList.contains('simple-mode')).toBe(true);
+
+    fireEvent.click(diyBtn);
+    await waitFor(() => {
+      expect(usePlayerStore.getState().diyMode).toBe(true);
+      expect(diyBtn.classList.contains('on')).toBe(true);
+      expect(fullscreenDiyBtn.classList.contains('on')).toBe(true);
+      expect(document.documentElement.classList.contains('simple-mode-preload')).toBe(false);
+      expect(document.documentElement.classList.contains('diy-mode-preload')).toBe(true);
+      expect(document.body.classList.contains('diy-mode')).toBe(true);
+    });
+
+    fireEvent.click(fxFab);
+    await waitFor(() => {
+      expect(usePlayerStore.getState().fxPanelOpen).toBe(true);
+      expect(fxPanel.classList.contains('show')).toBe(true);
+      expect(fxPanel.getAttribute('aria-hidden')).toBe('false');
+    });
+
+    fireEvent.click(fxToggleBtn);
+    await waitFor(() => {
+      expect(usePlayerStore.getState().fxPanelOpen).toBe(false);
+      expect(fxPanel.classList.contains('show')).toBe(false);
+    });
+
+    fireEvent.click(fxToggleBtn);
+    await waitFor(() => {
+      expect(usePlayerStore.getState().fxPanelOpen).toBe(true);
+      expect(fxPanel.classList.contains('show')).toBe(true);
+    });
+
+    fireEvent.click(diyBtn);
+    await waitFor(() => {
+      expect(usePlayerStore.getState().diyMode).toBe(false);
+      expect(usePlayerStore.getState().fxPanelOpen).toBe(false);
+      expect(fxPanel.classList.contains('show')).toBe(false);
+      expect(diyBtn.classList.contains('on')).toBe(false);
+      expect(document.documentElement.classList.contains('simple-mode-preload')).toBe(true);
+      expect(document.body.classList.contains('simple-mode')).toBe(true);
+    });
+
+    document.documentElement.className = '';
+  });
+
+  it('底栏布局与 simple-mode 隐藏规则在两份 index.css 中保持同步防重叠', async () => {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const frontendCss = fs.readFileSync(
+      path.resolve(process.cwd(), 'public/css/index.css'),
+      'utf8'
+    );
+    const rootCss = fs.readFileSync(
+      path.resolve(process.cwd(), '../public/css/index.css'),
+      'utf8'
+    );
+    expect(frontendCss).toBe(rootCss);
+    expect(frontendCss).toContain('body.simple-mode #shelf-toggle-btn');
+    expect(frontendCss).toContain('body.simple-mode #fx-panel-toggle-btn');
+    expect(frontendCss).toContain(
+      'grid-template-columns: minmax(0, 1fr) max-content minmax(max-content, 1fr);'
+    );
+  });
 });
