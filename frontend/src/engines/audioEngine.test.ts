@@ -439,4 +439,125 @@ describe('新增 Engine 与 Store 契约补完验证', () => {
     expect(document.documentElement.style.getPropertyValue('--home-accent')).toBe('#112233');
     expect(document.documentElement.style.getPropertyValue('--playlist-panel-glass-blur')).toBe('24px');
   });
+
+  it('audioEngine.playTrack 丢弃被新切歌取消的慢响应且 dispose 释放节点', async () => {
+    const engine = new AudioEngine();
+    let resolveSlow!: (v: string) => void;
+    const resolveSpy = vi.spyOn(engine, 'resolveSongPlaybackUrl').mockImplementation((song) => {
+      if (song.id === 'slow') {
+        return new Promise<string>((r) => {
+          resolveSlow = r;
+        });
+      }
+      return Promise.resolve('https://cdn.example.com/fast.mp3');
+    });
+
+    const slowPromise = engine.playTrack({ id: 'slow', name: 'Slow' }, 'exhigh', false);
+    const fastRes = await engine.playTrack({ id: 'fast', name: 'Fast' }, 'exhigh', false);
+    expect(fastRes).toBe('https://cdn.example.com/fast.mp3');
+
+    resolveSlow('https://cdn.example.com/slow.mp3');
+    const slowRes = await slowPromise;
+    expect(slowRes).toBe('');
+    expect(engine.getActiveAudioElement()?.src).toContain('fast.mp3');
+
+    engine.dispose();
+    expect(engine.getActiveAudioElement()?.getAttribute('src')).toBeNull();
+    resolveSpy.mockRestore();
+  });
+
+  it('playerStore.searchTracks 支持 res.podcasts 映射且按序号丢弃过期搜索响应', async () => {
+    let resolveOld!: (resp: Response) => void;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('keywords=old')) {
+          return new Promise<Response>((r) => {
+            resolveOld = r;
+          });
+        }
+        if (url.includes('/api/podcast/search')) {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                podcasts: [
+                  {
+                    id: 'pod-1',
+                    name: '深夜电台',
+                    dj: { nickname: '主播A' },
+                    category: '音乐故事',
+                    picUrl: 'https://img.example.com/pod.jpg',
+                  },
+                ],
+                total: 1,
+              }),
+              { status: 200 }
+            )
+          );
+        }
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              songs: [{ id: 'new-1', name: 'New Track', provider: 'netease' }],
+            }),
+            { status: 200 }
+          )
+        );
+      })
+    );
+
+    const store = usePlayerStore.getState();
+    const slowPromise = store.searchTracks('old', 'song');
+    const fastList = await store.searchTracks('new', 'song');
+    expect(fastList).toHaveLength(1);
+    expect(fastList[0].id).toBe('new-1');
+
+    resolveOld(
+      new Response(JSON.stringify({ songs: [{ id: 'stale-1', name: 'Stale' }] }), { status: 200 })
+    );
+    const staleList = await slowPromise;
+    expect(staleList).toEqual([]);
+    expect(usePlayerStore.getState().searchResults[0].id).toBe('new-1');
+
+    const podList = await store.searchTracks('夜话', 'podcast');
+    expect(podList).toHaveLength(1);
+    expect(podList[0]).toMatchObject({
+      id: 'pod-1',
+      rid: 'pod-1',
+      name: '深夜电台',
+      artist: '主播A',
+      type: 'podcast-radio',
+      provider: 'netease',
+    });
+  });
+
+  it('GestureEngine 在 start 异步等待期间调用 stop 会安全取消且清理流', async () => {
+    const { GestureEngine } = await import('./gestureEngine');
+    const engine = new GestureEngine();
+    const trackStop = vi.fn();
+    let resolveMedia!: (stream: MediaStream) => void;
+    Object.defineProperty(navigator, 'mediaDevices', {
+      configurable: true,
+      value: {
+        getUserMedia: vi.fn(
+          () =>
+            new Promise<MediaStream>((r) => {
+              resolveMedia = r;
+            })
+        ),
+      },
+    });
+
+    const startPromise = engine.start();
+    engine.stop();
+    resolveMedia({
+      getTracks: () => [{ stop: trackStop }],
+    } as unknown as MediaStream);
+
+    const ok = await startPromise;
+    expect(ok).toBe(false);
+    expect(engine.isActive()).toBe(false);
+    expect(trackStop).toHaveBeenCalledTimes(1);
+  });
 });

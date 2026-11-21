@@ -40,6 +40,7 @@ describe('tauriBridge', () => {
     expect(endpoints).toEqual({
       httpBase: 'http://127.0.0.1:3000',
       mediaToken: '',
+      wallpaperMediaToken: '',
     });
 
     const state = await desktopWindow.getState();
@@ -83,7 +84,11 @@ describe('tauriBridge', () => {
     const invokeSpy = vi.fn(async (cmd: string, args?: Record<string, unknown>) => {
       switch (cmd) {
         case 'get_runtime_endpoints':
-          return { httpBase: 'http://127.0.0.1:45678/', mediaToken: 'tok-999' };
+          return {
+            httpBase: 'http://127.0.0.1:45678/',
+            mediaToken: 'tok-999',
+            wallpaperMediaToken: 'we-tok-888',
+          };
         case 'get_login_easter_egg_status':
           return {
             ok: true,
@@ -126,17 +131,21 @@ describe('tauriBridge', () => {
     expect(endpoints).toEqual({
       httpBase: 'http://127.0.0.1:45678',
       mediaToken: 'tok-999',
+      wallpaperMediaToken: 'we-tok-888',
     });
 
-    // Tauri 下显式 HTTP 兜底会自动携带 cap=mediaToken
+    // Tauri 下显式 HTTP 兜底会按领域携带对应的 capability token
     expect(resolveMediaUrl('mineradio-local://audio/abc', { preferHttpFallback: true })).toBe(
       'http://127.0.0.1:45678/local-media/audio/abc?cap=tok-999'
     );
     expect(
-      resolveMediaUrl('mineradio-wallpaper://media/99?path=scene.mp4', {
+      resolveMediaUrl('mineradio-wallpaper://media/99?path=scene%2Emp4', {
         preferHttpFallback: true,
       })
-    ).toBe('http://127.0.0.1:45678/we-media/file/99?path=scene.mp4&cap=tok-999');
+    ).toBe('http://127.0.0.1:45678/we-media/file/99?path=scene%2Emp4&cap=we-tok-888');
+    expect(resolveMediaUrl('/we-media/file/99?path=loop%2Emp4')).toBe(
+      'http://127.0.0.1:45678/we-media/file/99?path=loop%2Emp4&cap=we-tok-888'
+    );
     // Tauri 下默认保留自定义协议
     expect(resolveMediaUrl('mineradio-local://audio/abc')).toBe('mineradio-local://audio/abc');
     expect(resolveMediaUrl('/assets/skull-decimation-points.bin')).toBe(

@@ -779,9 +779,11 @@ export class AudioEngine {
 
   private applyDeckGain(deck: DeckGraph, gainValue: number): void {
     const val = clamp(gainValue, 0, 1);
+    const now = this.ctx?.currentTime || 0;
     if (deck.gainNode) {
       try {
-        deck.gainNode.gain.setValueAtTime(val, this.ctx?.currentTime || 0);
+        deck.gainNode.gain.cancelScheduledValues?.(now);
+        deck.gainNode.gain.setValueAtTime(val, now);
       } catch {
         deck.gainNode.gain.value = val;
       }
@@ -807,14 +809,33 @@ export class AudioEngine {
     const now = this.ctx?.currentTime || 0;
     if (deck.filterNode) {
       deck.filterNode.type = 'highpass';
+      deck.filterNode.frequency.cancelScheduledValues?.(now);
       deck.filterNode.frequency.setValueAtTime(20, now);
     }
-    if (deck.bassNode) deck.bassNode.gain.setValueAtTime(0, now);
-    if (deck.midNode) deck.midNode.gain.setValueAtTime(0, now);
-    if (deck.highNode) deck.highNode.gain.setValueAtTime(0, now);
-    if (deck.echoSendNode) deck.echoSendNode.gain.setValueAtTime(0, now);
-    if (deck.echoFeedbackNode) deck.echoFeedbackNode.gain.setValueAtTime(0, now);
-    if (deck.echoWetNode) deck.echoWetNode.gain.setValueAtTime(0, now);
+    if (deck.bassNode) {
+      deck.bassNode.gain.cancelScheduledValues?.(now);
+      deck.bassNode.gain.setValueAtTime(0, now);
+    }
+    if (deck.midNode) {
+      deck.midNode.gain.cancelScheduledValues?.(now);
+      deck.midNode.gain.setValueAtTime(0, now);
+    }
+    if (deck.highNode) {
+      deck.highNode.gain.cancelScheduledValues?.(now);
+      deck.highNode.gain.setValueAtTime(0, now);
+    }
+    if (deck.echoSendNode) {
+      deck.echoSendNode.gain.cancelScheduledValues?.(now);
+      deck.echoSendNode.gain.setValueAtTime(0, now);
+    }
+    if (deck.echoFeedbackNode) {
+      deck.echoFeedbackNode.gain.cancelScheduledValues?.(now);
+      deck.echoFeedbackNode.gain.setValueAtTime(0, now);
+    }
+    if (deck.echoWetNode) {
+      deck.echoWetNode.gain.cancelScheduledValues?.(now);
+      deck.echoWetNode.gain.setValueAtTime(0, now);
+    }
     deck.audio.playbackRate = 1;
   }
 
@@ -880,7 +901,7 @@ export class AudioEngine {
     quality: QualityPreference = 'exhigh',
     autoplay = true
   ): Promise<string> {
-    this.trackToken++;
+    const token = ++this.trackToken;
     this.clearCuefieldTimers();
     this.pendingTransition = null;
     this.executingTransition = false;
@@ -896,6 +917,7 @@ export class AudioEngine {
     }
 
     const url = await this.resolveSongPlaybackUrl(song, quality);
+    if (token !== this.trackToken) return '';
     if (!url) throw new Error('EMPTY_AUDIO_URL');
 
     const active = this.activeDeck;
@@ -911,10 +933,19 @@ export class AudioEngine {
 
     if (autoplay && typeof active.audio.play === 'function') {
       await active.audio.play();
+      if (token !== this.trackToken) {
+        try {
+          active.audio.pause?.();
+        } catch {
+          // ignore
+        }
+        return '';
+      }
       this.playing = true;
       this.callbacks.onPlayStateChange?.(true);
     }
 
+    if (token !== this.trackToken) return '';
     // 异步预分析当前歌曲节拍（不阻塞起播）
     this.ensureBeatMap(song, url).catch(() => {});
     if (this.automixEnabled) {
@@ -1041,8 +1072,11 @@ export class AudioEngine {
       const nextUrl = await this.resolveSongPlaybackUrl(ctx.nextSong, ctx.quality);
       if (serial !== this.cuefieldSerial || token !== this.trackToken) return;
 
+      const currentUrl =
+        this.activeDeck.audio.src ||
+        (ctx.currentSong.url ? audioProxyUrl(String(ctx.currentSong.url)) : undefined);
       await Promise.all([
-        this.ensureBeatMap(ctx.currentSong),
+        this.ensureBeatMap(ctx.currentSong, currentUrl),
         this.ensureBeatMap(ctx.nextSong, nextUrl),
       ]);
       if (serial !== this.cuefieldSerial || token !== this.trackToken) return;
@@ -1457,8 +1491,8 @@ export class AudioEngine {
         this.beatMapCache.set(key, map);
         this.callbacks.onBeatMapReady?.(key, map);
 
-        // 异步上报 /api/beatmap/cache
-        apiJson('/api/beatmap/cache', {
+        // 等待写入 /api/beatmap/cache 落盘，保证紧接的 /api/cuefield/transition 可立即命中缓存
+        await apiJson('/api/beatmap/cache', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1658,15 +1692,49 @@ export class AudioEngine {
   }
 
   public dispose(): void {
+    this.trackToken++;
     this.clearCuefieldTimers();
+    this.pendingTransition = null;
+    this.executingTransition = false;
     (['A', 'B'] as DeckId[]).forEach((id) => {
       const deck = this.decks[id];
+      this.clearDeckLoop(deck);
       try {
         deck.audio.pause?.();
         deck.audio.removeAttribute?.('src');
       } catch {
         // ignore
       }
+      try {
+        deck.source?.disconnect?.();
+        deck.filterNode?.disconnect?.();
+        deck.bassNode?.disconnect?.();
+        deck.midNode?.disconnect?.();
+        deck.highNode?.disconnect?.();
+        deck.analyser?.disconnect?.();
+        deck.beatAnalyser?.disconnect?.();
+        deck.echoSendNode?.disconnect?.();
+        deck.echoDelayNode?.disconnect?.();
+        deck.echoFeedbackNode?.disconnect?.();
+        deck.echoWetNode?.disconnect?.();
+        deck.gainNode?.disconnect?.();
+      } catch {
+        // ignore
+      }
+      deck.source = null;
+      deck.mediaSourceBound = false;
+      deck.usesCapture = false;
+      deck.filterNode = null;
+      deck.bassNode = null;
+      deck.midNode = null;
+      deck.highNode = null;
+      deck.analyser = null;
+      deck.beatAnalyser = null;
+      deck.echoSendNode = null;
+      deck.echoDelayNode = null;
+      deck.echoFeedbackNode = null;
+      deck.echoWetNode = null;
+      deck.gainNode = null;
     });
     if (this.ctx && this.ctx.state !== 'closed') {
       this.ctx.close?.().catch(() => {});

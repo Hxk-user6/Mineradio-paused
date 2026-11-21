@@ -1621,12 +1621,20 @@ export class VisualEngine {
       case 'song':
       case 'serif':
         return '"Noto Serif SC", "Songti SC", serif';
+      case 'kai-song':
+        return '"LXGW WenKai", "Kaiti SC", "STKaiti", "Noto Serif SC", serif';
+      case 'serif-en':
+        return 'Georgia, "Times New Roman", "Noto Serif SC", serif';
       case 'hei':
         return '"PingFang SC", "Microsoft YaHei", "Noto Sans SC", sans-serif';
       case 'mono':
         return '"JetBrains Mono", monospace';
+      case 'gothic':
+        return '"UnifrakturCook", "Century Gothic", "Cinzel Decorative", sans-serif';
       case 'cinzel':
         return '"Cinzel Decorative", "Noto Serif SC", serif';
+      case 'display':
+        return '"Cinzel Decorative", "Noto Serif SC", Inter, serif';
       case 'fraktur':
         return '"UnifrakturCook", "Cinzel Decorative", serif';
       default:
@@ -2287,6 +2295,7 @@ export class VisualEngine {
     }
     this.shelfSlots = [];
     this.shelfCoverCache.clear();
+    this.currentCoverUrl = '';
     this.renderer?.dispose();
     this.renderer?.domElement?.remove();
 

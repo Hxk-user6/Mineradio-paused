@@ -432,6 +432,48 @@ let lastStatsTrackKey = '';
 let lastStatsAudioTime = 0;
 let statsSecondFraction = 0;
 let lastStatsSaveAt = 0;
+let searchRequestSeq = 0;
+let playRequestSeq = 0;
+let playlistTracksRequestSeq = 0;
+
+function mapPodcastSearchEntries(rawPodcasts: unknown): SongRecord[] {
+  if (!Array.isArray(rawPodcasts)) return [];
+  const out: SongRecord[] = [];
+  for (const raw of rawPodcasts) {
+    if (!raw || typeof raw !== 'object') continue;
+    const item = raw as Record<string, unknown>;
+    const djObj =
+      item.dj && typeof item.dj === 'object' ? (item.dj as Record<string, unknown>) : null;
+    const rawId = item.id ?? item.rid ?? item.radioId ?? item.podcastId;
+    if (rawId === undefined || rawId === null || String(rawId).trim() === '') continue;
+    const idStr = String(rawId);
+    const artist = String(
+      item.djName ||
+        djObj?.nickname ||
+        item.artist ||
+        item.nickname ||
+        '播客电台'
+    ).trim();
+    const album = String(item.category || item.sub || item.desc || '播客电台').trim();
+    const cover = String(
+      item.cover || item.picUrl || item.coverUrl || item.avatarUrl || ''
+    ).trim();
+    out.push({
+      id: idStr,
+      rid: idStr,
+      radioId: idStr,
+      podcastId: idStr,
+      name: String(item.name || item.title || '未知播客'),
+      artist,
+      album,
+      cover,
+      provider: 'netease',
+      source: 'netease',
+      type: 'podcast-radio',
+    });
+  }
+  return out;
+}
 
 export const usePlayerStore = create<PlayerStoreState>()((set, get) => ({
   // 播放与队列状态
@@ -579,7 +621,8 @@ export const usePlayerStore = create<PlayerStoreState>()((set, get) => ({
             activeLyricIdx: nextActiveIdx,
             todayListeningStats: nextStats,
           });
-          visualEngine.setLyrics(st.lyrics, nextActiveIdx, currentTime);
+          const effectiveLyricTime = Math.max(0, currentTime + st.lyricOffsetSec);
+          visualEngine.setLyrics(st.lyrics, nextActiveIdx, effectiveLyricTime);
           if (idxChanged && st.desktopLyricsEnabled && st.currentSong) {
             const line = st.lyrics[nextActiveIdx];
             const nextLine = st.lyrics[nextActiveIdx + 1];
@@ -591,7 +634,7 @@ export const usePlayerStore = create<PlayerStoreState>()((set, get) => ({
                 translation: line?.translation || '',
                 nextLine: nextLine?.text || '',
                 playing: st.playing,
-                currentTime,
+                currentTime: effectiveLyricTime,
                 duration,
               })
               .catch(() => {});
@@ -676,7 +719,8 @@ export const usePlayerStore = create<PlayerStoreState>()((set, get) => ({
                 get().lyricOffsetSec
               );
               set({ lyrics: parsed, activeLyricIdx: activeIdx });
-              visualEngine.setLyrics(parsed, activeIdx, get().currentTime);
+              const effectiveLyricTime = Math.max(0, get().currentTime + get().lyricOffsetSec);
+              visualEngine.setLyrics(parsed, activeIdx, effectiveLyricTime);
               if (get().desktopLyricsEnabled) {
                 const line = parsed[activeIdx] || parsed[0];
                 const nextLine = parsed[activeIdx + 1] || parsed[1];
@@ -688,7 +732,7 @@ export const usePlayerStore = create<PlayerStoreState>()((set, get) => ({
                     translation: line?.translation || '',
                     nextLine: nextLine?.text || '',
                     playing: get().playing,
-                    currentTime: get().currentTime,
+                    currentTime: effectiveLyricTime,
                     duration: get().duration,
                   })
                   .catch(() => {});
@@ -727,32 +771,6 @@ export const usePlayerStore = create<PlayerStoreState>()((set, get) => ({
             fromLrc,
             toLrc,
           };
-        },
-      });
-
-      gestureEngine.setCallbacks({
-        onStatusChange: (gestureStatus, gestureHint = '') => {
-          set({
-            gestureEnabled: gestureStatus === 'active' || gestureStatus === 'starting',
-            gestureStatus,
-            gestureHint,
-          });
-        },
-        onPlayPause: () => {
-          get().togglePlay().catch(() => {});
-        },
-        onNextTrack: () => {
-          get().nextTrack().catch(() => {});
-        },
-        onPrevTrack: () => {
-          get().prevTrack().catch(() => {});
-        },
-        onVolumeChange: (deltaOrVal, isAbsolute) => {
-          const nextVol = isAbsolute ? deltaOrVal : get().volume + deltaOrVal;
-          get().setVolume(nextVol);
-        },
-        onError: (err) => {
-          set({ gestureEnabled: false, gestureStatus: 'error', gestureHint: err });
         },
       });
 
@@ -832,6 +850,7 @@ export const usePlayerStore = create<PlayerStoreState>()((set, get) => ({
   },
 
   searchTracks: async (query: string, mode?: SearchMode) => {
+    const reqSeq = ++searchRequestSeq;
     const trimmed = String(query || '').trim();
     const activeMode = mode ?? get().searchMode;
     set({ searchQuery: query, searchMode: activeMode });
@@ -857,20 +876,28 @@ export const usePlayerStore = create<PlayerStoreState>()((set, get) => ({
         songs?: SongRecord[];
         tracks?: SongRecord[];
         results?: SongRecord[];
+        podcasts?: unknown[];
         data?: { songs?: SongRecord[] };
       }>(endpoint, { timeoutMs: 12000 });
 
+      if (reqSeq !== searchRequestSeq) return [];
       const list =
-        res.songs || res.tracks || res.results || res.data?.songs || [];
+        res.songs ||
+        res.tracks ||
+        res.results ||
+        res.data?.songs ||
+        mapPodcastSearchEntries(res.podcasts);
       set({ searchResults: list, searchLoading: false });
       return list;
     } catch {
+      if (reqSeq !== searchRequestSeq) return [];
       set({ searchResults: [], searchLoading: false });
       return [];
     }
   },
 
   playSong: async (songOrIndex: SongRecord | number, queue?: SongRecord[]) => {
+    const reqSeq = ++playRequestSeq;
     const state = get();
     const nextQueue = Array.isArray(queue) ? queue : state.playQueue;
     let targetSong: SongRecord | null = null;
@@ -943,10 +970,12 @@ export const usePlayerStore = create<PlayerStoreState>()((set, get) => ({
     visualEngine.setShelfItems(buildShelfItemsFromState(get()), get().shelfOpen);
 
     try {
-      await audioEngine.playTrack(targetSong, get().quality, true);
+      const resolvedUrl = await audioEngine.playTrack(targetSong, get().quality, true);
+      if (reqSeq !== playRequestSeq || !resolvedUrl) return;
       set({ playing: true, audioError: null });
       visualEngine.setPlaying(true);
     } catch (err) {
+      if (reqSeq !== playRequestSeq) return;
       const msg = err instanceof Error ? err.message : String(err);
       set({ playing: false, audioError: msg });
       visualEngine.setPlaying(false);
@@ -956,11 +985,20 @@ export const usePlayerStore = create<PlayerStoreState>()((set, get) => ({
     const key = songIdentityKey(targetSong);
     try {
       const lrcPayload = await fetchSongLyricPayload(targetSong);
-      if (get().currentSong && songIdentityKey(get().currentSong) === key && lrcPayload?.lyric) {
+      if (
+        reqSeq === playRequestSeq &&
+        get().currentSong &&
+        songIdentityKey(get().currentSong) === key &&
+        lrcPayload?.lyric
+      ) {
         const parsed = parseLrcText(lrcPayload.lyric, lrcPayload.tlyric, lrcPayload.romalrc);
         const activeIdx = findActiveLyricIndex(parsed, get().currentTime, get().lyricOffsetSec);
         set({ lyrics: parsed, activeLyricIdx: activeIdx });
-        visualEngine.setLyrics(parsed, activeIdx, get().currentTime);
+        visualEngine.setLyrics(
+          parsed,
+          activeIdx,
+          Math.max(0, get().currentTime + get().lyricOffsetSec)
+        );
       }
     } catch {
       // ignore lyric fetch failure
@@ -1014,7 +1052,7 @@ export const usePlayerStore = create<PlayerStoreState>()((set, get) => ({
     const st = get();
     const activeIdx = findActiveLyricIndex(st.lyrics, nextTime, st.lyricOffsetSec);
     set({ currentTime: nextTime, activeLyricIdx: activeIdx });
-    visualEngine.setLyrics(st.lyrics, activeIdx, nextTime);
+    visualEngine.setLyrics(st.lyrics, activeIdx, Math.max(0, nextTime + st.lyricOffsetSec));
   },
 
   setVolume: (volume: number) => {
@@ -1070,7 +1108,7 @@ export const usePlayerStore = create<PlayerStoreState>()((set, get) => ({
     const clamped = Math.max(-10, Math.min(10, Number(offsetSec) || 0));
     const activeIdx = findActiveLyricIndex(st.lyrics, st.currentTime, clamped);
     set({ lyricOffsetSec: clamped, activeLyricIdx: activeIdx });
-    visualEngine.setLyrics(st.lyrics, activeIdx, st.currentTime);
+    visualEngine.setLyrics(st.lyrics, activeIdx, Math.max(0, st.currentTime + clamped));
   },
 
   toggleDesktopLyrics: async (enabled?: boolean) => {
@@ -1127,11 +1165,13 @@ export const usePlayerStore = create<PlayerStoreState>()((set, get) => ({
 
   loadPlaylistTracks: async (playlist: PlaylistSummary) => {
     if (!playlist) return [];
+    const reqSeq = ++playlistTracksRequestSeq;
     if (playlist.provider === 'mineradio') {
       const res = await desktopWindow.readBuiltInPlaylist(String(playlist.id), {
         offset: 0,
         limit: 500,
       });
+      if (reqSeq !== playlistTracksRequestSeq) return [];
       const tracks = res.tracks || [];
       set({ activePlaylistTracks: tracks });
       return tracks;
@@ -1148,6 +1188,7 @@ export const usePlayerStore = create<PlayerStoreState>()((set, get) => ({
     const res = await apiJson<{ tracks?: SongRecord[]; songs?: SongRecord[] }>(endpoint, {
       timeoutMs: 12000,
     }).catch((): { tracks?: SongRecord[]; songs?: SongRecord[] } => ({ tracks: [] }));
+    if (reqSeq !== playlistTracksRequestSeq) return [];
     const tracks = res.tracks || res.songs || [];
     set({ activePlaylistTracks: tracks });
     return tracks;
@@ -1410,7 +1451,11 @@ export const usePlayerStore = create<PlayerStoreState>()((set, get) => ({
       const parsed = parseLrcText(lrcText);
       const activeIdx = findActiveLyricIndex(parsed, get().currentTime, get().lyricOffsetSec);
       set({ lyrics: parsed, activeLyricIdx: activeIdx });
-      visualEngine.setLyrics(parsed, activeIdx, get().currentTime);
+      visualEngine.setLyrics(
+        parsed,
+        activeIdx,
+        Math.max(0, get().currentTime + get().lyricOffsetSec)
+      );
     }
   },
 

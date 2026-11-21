@@ -1,5 +1,4 @@
 import { desktopWindow } from '../bridge/tauriBridge';
-import { visualEngine } from './visualEngine';
 
 export type GestureSensitivity = 'steady' | 'balanced' | 'quick';
 
@@ -53,6 +52,7 @@ function dist(a: HandLandmark | undefined, b: HandLandmark | undefined): number 
 export class GestureEngine {
   private active = false;
   private starting = false;
+  private startSeq = 0;
   private stream: MediaStream | null = null;
   private video: HTMLVideoElement | null = null;
   private rafId = 0;
@@ -119,6 +119,7 @@ export class GestureEngine {
   public async start(): Promise<boolean> {
     if (this.active) return true;
     if (this.starting) return false;
+    const seq = ++this.startSeq;
     this.starting = true;
     this.emitStatus('starting', '正在请求摄像头权限…');
 
@@ -128,6 +129,7 @@ export class GestureEngine {
           ok: false,
           granted: false,
         }));
+        if (seq !== this.startSeq) return false;
         if (perm && perm.granted === false && perm.ok === false) {
           this.emitStatus('denied', '摄像头权限被拒绝');
           this.callbacks.onError?.('CAMERA_PERMISSION_DENIED');
@@ -153,6 +155,14 @@ export class GestureEngine {
         },
         audio: false,
       });
+      if (seq !== this.startSeq) {
+        try {
+          stream.getTracks().forEach((track) => track.stop());
+        } catch {
+          // ignore
+        }
+        return false;
+      }
 
       this.stream = stream;
       if (typeof document !== 'undefined') {
@@ -162,10 +172,30 @@ export class GestureEngine {
         video.autoplay = true;
         video.srcObject = stream;
         await video.play().catch(() => {});
+        if (seq !== this.startSeq) {
+          try {
+            video.pause();
+            video.srcObject = null;
+          } catch {
+            // ignore
+          }
+          return false;
+        }
         this.video = video;
       }
 
       const mpLoaded = await this.tryInitMediaPipeHands();
+      if (seq !== this.startSeq) {
+        if (this.hands) {
+          try {
+            this.hands.close?.();
+          } catch {
+            // ignore
+          }
+          this.hands = null;
+        }
+        return false;
+      }
       this.mode = mpLoaded ? 'mediapipe' : 'motion';
       this.active = true;
       this.emitStatus(
@@ -177,17 +207,21 @@ export class GestureEngine {
       this.startLoop();
       return true;
     } catch (err) {
+      if (seq !== this.startSeq) return false;
       const msg = err instanceof Error ? err.message : String(err);
       this.stop();
       this.emitStatus('error', `无法启动摄像头：${msg}`);
       this.callbacks.onError?.(msg);
       return false;
     } finally {
-      this.starting = false;
+      if (seq === this.startSeq) {
+        this.starting = false;
+      }
     }
   }
 
   public stop(): void {
+    this.startSeq++;
     this.active = false;
     this.starting = false;
     if (this.rafId) {
@@ -474,7 +508,6 @@ export class GestureEngine {
       if (Math.abs(dx) > 0.002 || Math.abs(dy) > 0.002) {
         const ry = -dx * 3.8;
         const rx = dy * 3.2;
-        visualEngine.applyGestureRotation(rx, ry);
         this.callbacks.onRotateVisual?.(rx, ry);
       }
     }
@@ -549,7 +582,6 @@ export class GestureEngine {
       const dx = cx - this.prevMotionCentroid.x;
       const dy = cy - this.prevMotionCentroid.y;
 
-      visualEngine.applyGestureRotation(dy * 2.4, -dx * 2.8);
       this.callbacks.onRotateVisual?.(dy * 2.4, -dx * 2.8);
 
       if (now >= this.actionCooldownUntil) {

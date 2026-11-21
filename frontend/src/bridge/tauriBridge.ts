@@ -136,6 +136,7 @@ export async function getRuntimeEndpoints(forceRefresh = false): Promise<Runtime
         const normalized: RuntimeEndpoints = {
           httpBase: normalizeHttpBase(res?.httpBase),
           mediaToken: String(res?.mediaToken || ''),
+          wallpaperMediaToken: String(res?.wallpaperMediaToken || ''),
         };
         cachedEndpoints = normalized;
         return normalized;
@@ -146,6 +147,7 @@ export async function getRuntimeEndpoints(forceRefresh = false): Promise<Runtime
     const fallback: RuntimeEndpoints = {
       httpBase: DEFAULT_HTTP_BASE,
       mediaToken: '',
+      wallpaperMediaToken: '',
     };
     cachedEndpoints = fallback;
     return fallback;
@@ -164,6 +166,10 @@ export function getCachedHttpBase(): string {
 
 export function getCachedMediaToken(): string {
   return cachedEndpoints?.mediaToken || '';
+}
+
+export function getCachedWallpaperMediaToken(): string {
+  return cachedEndpoints?.wallpaperMediaToken || '';
 }
 
 function appendQueryParam(url: string, key: string, value: string): string {
@@ -190,6 +196,7 @@ export function resolveMediaUrl(
 
   const httpBase = getCachedHttpBase();
   const mediaToken = getCachedMediaToken();
+  const wallpaperMediaToken = getCachedWallpaperMediaToken();
   const preferHttp = opts?.preferHttpFallback ?? !isTauriRuntime();
 
   if (raw.startsWith('mineradio-local://')) {
@@ -198,7 +205,7 @@ export function resolveMediaUrl(
       .replace(/^mineradio-local:\/\/(?:localhost\/)?/i, '')
       .replace(/^\/+/, '');
     const httpUrl = `${httpBase}/local-media/${stripped}`;
-    return mediaToken && !/[?&]cap=/.test(httpUrl)
+    return mediaToken && !/[?&](cap|token)=/i.test(httpUrl)
       ? appendQueryParam(httpUrl, 'cap', mediaToken)
       : httpUrl;
   }
@@ -212,7 +219,21 @@ export function resolveMediaUrl(
       ? `file/${stripped.slice('media/'.length)}`
       : stripped;
     const httpUrl = `${httpBase}/we-media/${normalizedPath}`;
-    return mediaToken && !/[?&]cap=/.test(httpUrl)
+    return wallpaperMediaToken && !/[?&](cap|token)=/i.test(httpUrl)
+      ? appendQueryParam(httpUrl, 'cap', wallpaperMediaToken)
+      : httpUrl;
+  }
+
+  if (raw.startsWith('/we-media/')) {
+    const httpUrl = `${httpBase}${raw}`;
+    return wallpaperMediaToken && !/[?&](cap|token)=/i.test(httpUrl)
+      ? appendQueryParam(httpUrl, 'cap', wallpaperMediaToken)
+      : httpUrl;
+  }
+
+  if (raw.startsWith('/local-media/')) {
+    const httpUrl = `${httpBase}${raw}`;
+    return mediaToken && !/[?&](cap|token)=/i.test(httpUrl)
       ? appendQueryParam(httpUrl, 'cap', mediaToken)
       : httpUrl;
   }

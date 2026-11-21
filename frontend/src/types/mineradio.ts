@@ -25,6 +25,7 @@ export interface SongRecord {
   resHash?: string;
   providerSongId?: string;
   provider_song_id?: string;
+  rid?: string | number;
   trackId?: string | number;
   track_id?: string | number;
   albumId?: string | number;
@@ -561,6 +562,7 @@ export interface DesktopWindowState {
 export interface RuntimeEndpoints {
   httpBase: string;
   mediaToken: string;
+  wallpaperMediaToken?: string;
 }
 
 export interface PlatformLoginEntry {
